@@ -4299,6 +4299,7 @@
     "copilotCount": "{{remaining}} of {{total}} left",
     "copilotNotIncluded": "Not in your plan",
     "utilization": "{{value}}%",
+    "estQuota": "Est. quota {{value}}",
     "resetsIn": "Resets in {{time}}",
     "extraUsage": "Extra Usage",
     "expired": "Session expired",
