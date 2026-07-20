@@ -4143,6 +4143,7 @@
     "credits": "クレジット",
     "copilotPremium": "プレミアム",
     "utilization": "{{value}}%",
+    "estQuota": "推定枠 {{value}}",
     "resetsIn": "{{time}}後にリセット",
     "extraUsage": "超過使用量",
     "expired": "セッション期限切れ",
