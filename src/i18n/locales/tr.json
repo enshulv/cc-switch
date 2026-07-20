@@ -4270,6 +4270,7 @@
     "copilotCount": "{{remaining}} / {{total}} kaldı",
     "copilotNotIncluded": "Planınızda yok",
     "utilization": "{{value}}%",
+    "estQuota": "Tahmini kota {{value}}",
     "resetsIn": "{{time}} sonra sıfırlanır",
     "extraUsage": "Ekstra Kullanım",
     "expired": "Oturumun süresi doldu",
