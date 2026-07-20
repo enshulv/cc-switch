@@ -1,3 +1,18 @@
+<!-- FORK NOTICE — enshulv/cc-switch -->
+> ## 🍴 关于本 Fork（enshulv/cc-switch）
+>
+> 这是 [farion1231/cc-switch](https://github.com/farion1231/cc-switch) 的**个人自用分支**。**与上游的不同之处：**
+>
+> - ➕ **订阅额度按窗口内联显示美元估算**（Estimated dollar quota per window）—— 在订阅 / 用量页脚直接看到每个额度窗口的美元估算。
+> - ➕ **额度历史与额度趋势图**（Quota history & trend）—— 每小时记录一次各订阅窗口的使用率，使用统计页的趋势图可切到「额度」侧回看任意时间段的额度变化。
+> - 🔄 本 Fork 的改动直接长在 **`main`** 上，**每 3 天自动 rebase 到上游最新**，无冲突则自动构建 + 签名 + 发版。因此 `main` 会被强制推送——克隆后请用 `git reset --hard origin/main` 而不是 `git pull`。
+> - ⬆️ **App 内自动更新指向本 Fork**（使用本 Fork 自己的签名公钥），因此装了本 Fork 版的 app 只会更新到本 Fork 的构建，不会被上游覆盖。
+> - 📦 目前仅发布 **Windows x64** 安装包。
+>
+> > This is a personal fork of upstream. Functional differences: an **inline estimated dollar quota per window**, and **hourly quota history with a quota-trend chart** in the usage dashboard. The fork's commits live on **`main`**, which is auto-rebased onto upstream every 3 days and auto-released (so `main` is force-pushed — reset rather than pull). The in-app updater points at **this fork** (Windows x64).
+>
+> 以下为上游原始 README。
+
 <div align="center">
 
 # CC Switch
