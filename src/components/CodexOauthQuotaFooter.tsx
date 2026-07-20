@@ -43,6 +43,7 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
       appIdForExpiredHint="codex_oauth"
       inline={inline}
       display={display}
+      estimateAppId="codex"
     />
   );
 };

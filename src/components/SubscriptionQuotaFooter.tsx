@@ -17,6 +17,7 @@ import {
   type QuotaDisplay,
   type QuotaLine,
 } from "@/components/quota/quotaRules";
+import { useQuotaEstimateLine } from "@/components/usage/QuotaEstimateLine";
 
 export { countdownStr } from "@/components/quota/quotaRules";
 
@@ -39,6 +40,11 @@ interface SubscriptionQuotaViewProps {
   display?: QuotaDisplay;
   /** 查询成功但一档都没有时写的一句（Kimi 没订阅的号返回空对象）；不给时不显示 */
   emptyText?: string;
+  /**
+   * Fork: appId that enables the estimated-dollar-quota line (only "claude" /
+   * "codex"). Omitted → no estimate, the upstream display is untouched.
+   */
+  estimateAppId?: string;
 }
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
@@ -230,8 +236,13 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   inline = false,
   display = "left",
   emptyText,
+  estimateAppId,
 }) => {
   const { t, i18n } = useTranslation();
+  const estimateLine = useQuotaEstimateLine(estimateAppId, quota, {
+    label: (name) => tierShortLabel(t, name),
+    hidden: HIDDEN_INLINE_TIERS,
+  });
 
   // 无凭据 / 凭据解析错误 → 不显示（静默）
   if (!quota || quota.credentialStatus === "not_found") return null;
@@ -306,7 +317,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   }
 
   if (inline) {
-    return (
+    const column = (
       <QuotaLines
         lines={rows.map((row) => row.line)}
         queriedAt={quota.queriedAt}
@@ -314,6 +325,13 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
         onRefresh={refetch}
         breakdown={tierBreakdown(t, quota.tiers || [], display) ?? undefined}
       />
+    );
+    if (!estimateLine) return column;
+    return (
+      <span className="flex shrink-0 flex-col items-end">
+        {column}
+        {estimateLine}
+      </span>
     );
   }
 
@@ -383,6 +401,7 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
       appIdForExpiredHint={appId === "grokbuild" ? "grok" : appId}
       inline={inline}
       display={display}
+      estimateAppId={appId}
     />
   );
 };
