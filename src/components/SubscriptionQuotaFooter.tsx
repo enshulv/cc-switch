@@ -4,6 +4,11 @@ import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
 import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
+import {
+  useQuotaEstimates,
+  type TierEstimate,
+} from "@/components/usage/quotaEstimate";
+import { fmtUsd } from "@/components/usage/format";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
@@ -19,6 +24,12 @@ interface SubscriptionQuotaViewProps {
   /** 用于 `subscription.expiredHint` 的 {tool} 插值；解耦了 hook 的 appId */
   appIdForExpiredHint: string;
   inline?: boolean;
+  /**
+   * appId that enables the quota-estimate probe (only "claude" / "codex").
+   * When omitted, no estimate is computed and the original percentage-only
+   * display is preserved.
+   */
+  estimateAppId?: string;
 }
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
@@ -107,8 +118,13 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   refetch,
   appIdForExpiredHint,
   inline = false,
+  estimateAppId,
 }) => {
   const { t } = useTranslation();
+
+  // Quota-estimate probe (read-only; returns an empty Map when appId is
+  // omitted, leaving the original display untouched).
+  const estimates = useQuotaEstimates(estimateAppId, quota);
 
   // 定期更新相对时间显示
   const [now, setNow] = React.useState(Date.now());
@@ -241,11 +257,16 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
         </div>
 
         {/* 第二行：各 tier 使用百分比 */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-start gap-4">
           {tiers
             .filter((tier) => !HIDDEN_INLINE_TIERS.has(tier.name))
             .map((tier) => (
-              <TierBadge key={tier.name} tier={tier} t={t} />
+              <TierBadge
+                key={tier.name}
+                tier={tier}
+                t={t}
+                estimate={estimates.get(tier.name)}
+              />
             ))}
         </div>
       </div>
@@ -308,7 +329,8 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 export const TierBadge: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
-}> = ({ tier, t }) => {
+  estimate?: TierEstimate;
+}> = ({ tier, t, estimate }) => {
   const label = TIER_I18N_KEYS[tier.name]
     ? t(TIER_I18N_KEYS[tier.name])
     : tier.name;
@@ -316,24 +338,40 @@ export const TierBadge: React.FC<{
 
   const hasUsd = tier.usedValueUsd != null && tier.maxValueUsd != null;
 
+  // Show the line only once the estimate has passed its gate (enough window
+  // movement observed this session); the hook returns null until then.
+  const showEstimate = estimate?.quotaUsd != null;
+
   return (
-    <div className="flex items-center gap-0.5">
-      <span className="text-gray-500 dark:text-gray-400">{label}:</span>
-      <span
-        className={`font-semibold tabular-nums ${utilizationColor(tier.utilization)}`}
-      >
-        {t("subscription.utilization", { value: Math.round(tier.utilization) })}
-      </span>
-      {hasUsd && (
-        <span className="text-muted-foreground/60">
-          (${tier.usedValueUsd!.toFixed(2)}/${tier.maxValueUsd!.toFixed(2)})
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-0.5">
+        <span className="text-gray-500 dark:text-gray-400">{label}:</span>
+        <span
+          className={`font-semibold tabular-nums ${utilizationColor(tier.utilization)}`}
+        >
+          {t("subscription.utilization", {
+            value: Math.round(tier.utilization),
+          })}
         </span>
-      )}
-      {countdown && (
-        <span className="text-muted-foreground/60 ml-0.5 flex items-center gap-px">
-          <Clock size={10} />
-          {countdown}
-        </span>
+        {hasUsd && (
+          <span className="text-muted-foreground/60">
+            (${tier.usedValueUsd!.toFixed(2)}/${tier.maxValueUsd!.toFixed(2)})
+          </span>
+        )}
+        {countdown && (
+          <span className="text-muted-foreground/60 ml-0.5 flex items-center gap-px">
+            <Clock size={10} />
+            {countdown}
+          </span>
+        )}
+      </div>
+      {showEstimate && (
+        <div className="text-[10px] text-muted-foreground/60 tabular-nums">
+          {t("subscription.estQuota", {
+            value: fmtUsd(estimate!.quotaUsd, 0),
+            defaultValue: "Quota {{value}} est.",
+          })}
+        </div>
       )}
     </div>
   );
@@ -424,6 +462,7 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
       refetch={refetch}
       appIdForExpiredHint={appId}
       inline={inline}
+      estimateAppId={appId}
     />
   );
 };
