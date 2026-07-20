@@ -1,0 +1,222 @@
+name: Fork sync & release
+
+# Personal fork automation for enshulv/cc-switch.
+# Every 3 days: rebase `main` onto upstream (farion1231/cc-switch), then build +
+# sign + publish a Windows x64 release so the in-app updater (pointed at THIS
+# fork) can offer updates. Manual runs can force a release.
+#
+# `main` IS the feature branch here — the fork's own commits sit on top of
+# upstream and get replayed onto it every sync, so this workflow force-pushes
+# `main`. A local clone therefore needs `git reset --hard origin/main` after
+# each sync rather than a plain pull.
+
+on:
+  schedule:
+    - cron: "0 18 */3 * *" # every 3 days at 18:00 UTC (~02:00 CST)
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: "Build & release even if there are no new upstream commits"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: fork-sync-release
+  cancel-in-progress: false
+
+env:
+  FEATURE_BRANCH: main
+  UPSTREAM_URL: https://github.com/farion1231/cc-switch.git
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    name: Rebase feature branch onto upstream
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.rebase.outputs.changed }}
+      conflict: ${{ steps.rebase.outputs.conflict }}
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FEATURE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Rebase onto upstream
+        id: rebase
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          changed=false
+          conflict=false
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "No new upstream commits — nothing to rebase."
+          elif git rebase "upstream/$UPSTREAM_BRANCH"; then
+            git push --force-with-lease origin "HEAD:$FEATURE_BRANCH"
+            changed=true
+            echo "Rebased onto upstream and force-pushed $FEATURE_BRANCH."
+          else
+            git rebase --abort || true
+            conflict=true
+            echo "::warning::Rebase onto upstream hit conflicts; manual resolution needed."
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "conflict=$conflict" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "Auto-rebase failed: feature branch conflicts with upstream";
+            const { owner, repo } = context.repo;
+            const open = await github.rest.issues.listForRepo({ owner, repo, state: "open", per_page: 100 });
+            if (open.data.some((i) => i.title === title)) return;
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              body: [
+                "The scheduled `Fork sync & release` workflow could not rebase",
+                "`" + process.env.FEATURE_BRANCH + "` onto `upstream/" + process.env.UPSTREAM_BRANCH + "`",
+                "because of conflicts.",
+                "",
+                "Resolve locally:",
+                "```",
+                "git fetch upstream && git checkout " + process.env.FEATURE_BRANCH,
+                "git rebase upstream/" + process.env.UPSTREAM_BRANCH,
+                "# fix conflicts, then:",
+                "git push --force-with-lease origin " + process.env.FEATURE_BRANCH,
+                "```",
+              ].join("\n"),
+            });
+
+  build:
+    name: Build & release (Windows x64)
+    needs: sync
+    if: needs.sync.outputs.conflict != 'true' && (needs.sync.outputs.changed == 'true' || github.event.inputs.force_release == 'true')
+    runs-on: windows-2022
+    steps:
+      - name: Checkout feature branch (rebased)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FEATURE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Compute fork version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          VERSION="${MAJOR}.${MINOR}.${GITHUB_RUN_NUMBER}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Fork release version: $VERSION"
+
+      - name: Patch version into tauri.conf.json (CI only, not committed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e "const f='src-tauri/tauri.conf.json';const c=require('./'+f);c.version=process.argv[1];require('fs').writeFileSync(f, JSON.stringify(c,null,2)+'\n');" "${{ steps.ver.outputs.version }}"
+          node -p "require('./src-tauri/tauri.conf.json').version"
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build & sign (Windows x64 MSI)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: pnpm tauri build --bundles msi
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ steps.ver.outputs.version }}"
+          mkdir -p release-assets
+          MSI=$(find src-tauri/target/release/bundle/msi -maxdepth 1 -name "*.msi" | head -1)
+          SIG=$(find src-tauri/target/release/bundle/msi -maxdepth 1 -name "*.msi.sig" | head -1)
+          [ -n "$MSI" ] || { echo "::error::No MSI produced"; exit 1; }
+          [ -n "$SIG" ] || { echo "::error::No .msi.sig produced (signing failed?)"; exit 1; }
+          cp "$MSI" "release-assets/CC-Switch-v${VER}-Windows-x64.msi"
+          cp "$SIG" "release-assets/CC-Switch-v${VER}-Windows-x64.msi.sig"
+          ls -la release-assets
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs = require('fs');
+            const ver = process.argv[1];
+            const tag = process.argv[2];
+            const repo = process.argv[3];
+            const sig = fs.readFileSync('release-assets/CC-Switch-v' + ver + '-Windows-x64.msi.sig', 'utf8').trim();
+            const url = 'https://github.com/' + repo + '/releases/download/' + tag + '/CC-Switch-v' + ver + '-Windows-x64.msi';
+            const j = {
+              version: ver,
+              notes: 'Fork build ' + tag + ', rebased on upstream farion1231/cc-switch.',
+              pub_date: new Date().toISOString(),
+              platforms: { 'windows-x86_64': { signature: sig, url } },
+            };
+            fs.writeFileSync('release-assets/latest.json', JSON.stringify(j, null, 2));
+            console.log(fs.readFileSync('release-assets/latest.json', 'utf8'));
+          " "${{ steps.ver.outputs.version }}" "${{ steps.ver.outputs.tag }}" "${{ github.repository }}"
+
+      - name: Create and push tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: CC Switch ${{ steps.ver.outputs.tag }} (fork)
+          body: |
+            Automated personal-fork build, rebased on upstream **farion1231/cc-switch**.
+
+            **Difference from upstream:** inline estimated dollar quota per window in the subscription / usage footer.
+
+            The in-app updater on this fork points here, so installed fork builds update from this repo (Windows x64).
+          files: |
+            release-assets/CC-Switch-v${{ steps.ver.outputs.version }}-Windows-x64.msi
+            release-assets/CC-Switch-v${{ steps.ver.outputs.version }}-Windows-x64.msi.sig
+            release-assets/latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
