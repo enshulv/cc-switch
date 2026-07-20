@@ -3008,6 +3008,7 @@
     "monthly": "月間",
     "copilotPremium": "プレミアム",
     "utilization": "{{value}}%",
+    "estQuota": "利用枠 {{value}} est.",
     "resetsIn": "{{time}}後にリセット",
     "extraUsage": "超過使用量",
     "expired": "セッション期限切れ",
