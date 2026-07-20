@@ -42,6 +42,7 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
       refetch={refetch}
       inline={inline}
       display={display}
+      estimateAppId="codex"
     />
   );
 };

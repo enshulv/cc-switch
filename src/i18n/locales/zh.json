@@ -4274,6 +4274,7 @@
     "copilotCount": "剩余 {{remaining}} / 共 {{total}}",
     "copilotNotIncluded": "当前计划不含",
     "utilization": "{{value}}%",
+    "estQuota": "估算额度 {{value}}",
     "resetsIn": "{{time}}后重置",
     "extraUsage": "超额用量",
     "expired": "会话已过期",

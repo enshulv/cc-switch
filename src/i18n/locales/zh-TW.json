@@ -4275,6 +4275,7 @@
     "copilotCount": "剩餘 {{remaining}} / 共 {{total}}",
     "copilotNotIncluded": "目前方案不含",
     "utilization": "{{value}}%",
+    "estQuota": "估算額度 {{value}}",
     "resetsIn": "{{time}} 後重設",
     "extraUsage": "超額用量",
     "expired": "工作階段已過期",

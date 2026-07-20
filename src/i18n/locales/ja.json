@@ -4274,6 +4274,7 @@
     "copilotCount": "残り {{remaining}} / 合計 {{total}}",
     "copilotNotIncluded": "現在のプランに含まれません",
     "utilization": "{{value}}%",
+    "estQuota": "推定枠 {{value}}",
     "resetsIn": "{{time}}後にリセット",
     "extraUsage": "超過使用量",
     "expired": "セッション期限切れ",
