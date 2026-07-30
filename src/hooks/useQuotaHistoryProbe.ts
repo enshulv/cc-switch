@@ -28,6 +28,7 @@ import type { AppId } from "@/lib/api/types";
 import type { SubscriptionQuota } from "@/types/subscription";
 import type { VisibleApps } from "@/types";
 import {
+  hourIndex,
   toQuotaSamples,
   type TierSpendMap,
 } from "@/components/usage/quotaHistory";
@@ -105,13 +106,21 @@ export function useQuotaHistoryProbe({
   // `dataUpdatedAt` changes on every settled fetch, including a re-fetch that
   // returns the same numbers.
   const settleSignature = results.map((r) => r.dataUpdatedAt).join(",");
-  // The three apps settle at different times, so this effect re-runs ~3× per
-  // poll cycle. Without this guard each run would re-measure EVERY window of
-  // EVERY app — `measureTierSpend` calls `getModelStats` per window and bypasses
-  // react-query entirely, so that is dozens of usage-db aggregations per hour
-  // instead of the handful the design intends. Skip any app whose reading has
-  // not actually advanced.
-  const lastMeasuredRef = useRef<Map<string, number>>(new Map());
+  // Throttle to one measurement per app per MEASURED HOUR — the rate this probe
+  // actually claims to run at.
+  //
+  // Two multipliers would otherwise stack. The effect keys on all three apps'
+  // `dataUpdatedAt`, so it re-runs ~3× per poll cycle; and while the footer is on
+  // screen the shared query refetches every 5 min, giving 12 fresh readings an
+  // hour. Re-measuring on each would be ~180 `getModelStats` aggregations an hour
+  // (each potentially scanning a 30-day range, and bypassing react-query so
+  // nothing is deduped or cached) for a row that is only ever stored once per
+  // hour anyway.
+  //
+  // Keying on the hour bucket costs nothing real: C is cumulative WITHIN the
+  // window, so sampling at :05 instead of :55 shifts spend attribution between
+  // two adjacent hours but never loses it — ΣΔC telescopes either way.
+  const lastMeasuredHourRef = useRef<Map<string, number>>(new Map());
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
@@ -123,7 +132,8 @@ export function useQuotaHistoryProbe({
         const quota = results[index]?.data;
         const measuredAt = quota?.queriedAt ?? null;
         if (measuredAt == null) continue;
-        if (lastMeasuredRef.current.get(appId) === measuredAt) continue;
+        const measuredHour = hourIndex(measuredAt);
+        if (lastMeasuredHourRef.current.get(appId) === measuredHour) continue;
 
         const spend = await measureTierSpend(appId, quota);
         if (cancelled) return;
@@ -135,7 +145,7 @@ export function useQuotaHistoryProbe({
             sample.measuredAt,
             sample.tiers,
           );
-          lastMeasuredRef.current.set(appId, measuredAt);
+          lastMeasuredHourRef.current.set(appId, measuredHour);
           recorded = recorded || changed;
         } catch (error) {
           // A failed write costs one hourly sample; never break the app over it.
