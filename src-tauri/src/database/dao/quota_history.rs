@@ -38,6 +38,8 @@ pub struct QuotaTierSample {
     pub used_usd: Option<f64>,
     /// 供应商直接给出的窗口额度上限
     pub max_usd: Option<f64>,
+    /// 本机在该窗口内实测到的美元消耗；与 utilization 配对即可反推窗口总额度
+    pub spend_usd: Option<f64>,
 }
 
 /// 查询返回的一行：某应用某小时某窗口的读数
@@ -51,6 +53,7 @@ pub struct QuotaHistoryRow {
     pub utilization: f64,
     pub used_usd: Option<f64>,
     pub max_usd: Option<f64>,
+    pub spend_usd: Option<f64>,
 }
 
 /// 毫秒时间戳 → 纪元小时序号
@@ -59,6 +62,10 @@ fn hour_of(measured_at_ms: i64) -> i64 {
 }
 
 /// 惰性建表。放在每个入口而不是 `init()`，是为了完全不碰上游的初始化路径。
+///
+/// 本表不在迁移链上，所以自身的加列也得自己管：v3.19.6 发出去的版本没有
+/// `spend_usd`，装过那一版的库要就地补列，不能靠 `CREATE TABLE IF NOT EXISTS`
+/// （表已存在时它什么都不做）。
 fn ensure_table(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS fork_quota_history (
@@ -68,11 +75,30 @@ fn ensure_table(conn: &Connection) -> Result<(), AppError> {
              utilization REAL NOT NULL,
              used_usd    REAL,
              max_usd     REAL,
+             spend_usd   REAL,
              measured_at INTEGER NOT NULL,
              PRIMARY KEY (app_id, hour, tier)
          );",
     )
-    .map_err(|e| AppError::Database(format!("创建额度历史表失败: {e}")))
+    .map_err(|e| AppError::Database(format!("创建额度历史表失败: {e}")))?;
+
+    let has_spend_usd = conn
+        .prepare("SELECT 1 FROM pragma_table_info('fork_quota_history') WHERE name = 'spend_usd'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .map_err(|e| AppError::Database(format!("检查额度历史表结构失败: {e}")))?;
+    if !has_spend_usd {
+        // check-then-ALTER 在同一文件的多个连接间不是原子的：两边都看到缺列、都执行
+        // ALTER，输的一方拿到 "duplicate column name"。那说明列已经在了，是成功不是失败。
+        match conn.execute(
+            "ALTER TABLE fork_quota_history ADD COLUMN spend_usd REAL",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(AppError::Database(format!("补列 spend_usd 失败: {e}"))),
+        }
+    }
+    Ok(())
 }
 
 impl Database {
@@ -108,17 +134,19 @@ impl Database {
             let affected = conn
                 .execute(
                     "INSERT INTO fork_quota_history
-                         (app_id, hour, tier, utilization, used_usd, max_usd, measured_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         (app_id, hour, tier, utilization, used_usd, max_usd, spend_usd, measured_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(app_id, hour, tier) DO UPDATE SET
                          utilization = excluded.utilization,
                          used_usd    = excluded.used_usd,
                          max_usd     = excluded.max_usd,
+                         spend_usd   = excluded.spend_usd,
                          measured_at = excluded.measured_at
                      WHERE excluded.measured_at > fork_quota_history.measured_at
                        AND (fork_quota_history.utilization IS NOT excluded.utilization
                             OR fork_quota_history.used_usd IS NOT excluded.used_usd
-                            OR fork_quota_history.max_usd  IS NOT excluded.max_usd)",
+                            OR fork_quota_history.max_usd  IS NOT excluded.max_usd
+                            OR fork_quota_history.spend_usd IS NOT excluded.spend_usd)",
                     rusqlite::params![
                         app_id,
                         hour,
@@ -126,6 +154,7 @@ impl Database {
                         tier.utilization,
                         tier.used_usd,
                         tier.max_usd,
+                        tier.spend_usd,
                         measured_at_ms,
                     ],
                 )
@@ -155,7 +184,7 @@ impl Database {
         let conn = lock_conn!(self.conn);
         ensure_table(&conn)?;
 
-        let sql = "SELECT app_id, hour, tier, utilization, used_usd, max_usd
+        let sql = "SELECT app_id, hour, tier, utilization, used_usd, max_usd, spend_usd
                    FROM fork_quota_history
                    WHERE hour >= ?1 AND hour <= ?2
                      AND (?3 IS NULL OR app_id = ?3)
@@ -172,6 +201,7 @@ impl Database {
                     utilization: row.get(3)?,
                     used_usd: row.get(4)?,
                     max_usd: row.get(5)?,
+                    spend_usd: row.get(6)?,
                 })
             })
             .map_err(|e| AppError::Database(format!("查询额度历史失败: {e}")))?
@@ -201,6 +231,7 @@ mod tests {
             utilization,
             used_usd: None,
             max_usd: None,
+            spend_usd: None,
         }
     }
 
@@ -341,6 +372,7 @@ mod tests {
                 utilization: 12.5,
                 used_usd: Some(25.0),
                 max_usd: Some(200.0),
+                spend_usd: Some(41.5),
             }],
         )
         .expect("record");
@@ -348,6 +380,60 @@ mod tests {
         let rows = db.get_quota_history(None, 0, 100).expect("query");
         assert_eq!(rows[0].used_usd, Some(25.0));
         assert_eq!(rows[0].max_usd, Some(200.0));
+        assert_eq!(rows[0].spend_usd, Some(41.5));
+    }
+
+    #[test]
+    fn a_changed_spend_counts_as_new_information_even_when_the_percentage_held() {
+        // 厂商的百分比很粗，本机消耗却是连续变化的：同一小时内 U 不动而 C 动了，
+        // 也必须落库。少了 upsert WHERE 里的 spend_usd 那一支，这次写入会被静默丢掉，
+        // 行里留着偏小的 C，图上的额度被低估，而且 record 返回 false 导致图表不刷新。
+        let db = db();
+        let mut first = tier("five_hour", 20.0);
+        first.spend_usd = Some(10.0);
+        db.record_quota_history("claude", 10 * HOUR_MS, &[first])
+            .expect("first");
+
+        let mut second = tier("five_hour", 20.0); // 百分比没变
+        second.spend_usd = Some(18.0); // 消耗变了
+        let changed = db
+            .record_quota_history("claude", 10 * HOUR_MS + 30 * 60_000, &[second])
+            .expect("second");
+
+        assert!(changed, "消耗变化必须算作新信息");
+        let rows = db.get_quota_history(Some("claude"), 0, 100).expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].spend_usd, Some(18.0));
+    }
+
+    #[test]
+    fn adds_spend_usd_to_a_table_created_by_an_older_build() {
+        let db = db();
+        {
+            // v3.19.6 建的表：没有 spend_usd
+            let conn = db.conn.lock().expect("lock");
+            conn.execute_batch(
+                "CREATE TABLE fork_quota_history (
+                     app_id      TEXT NOT NULL,
+                     hour        INTEGER NOT NULL,
+                     tier        TEXT NOT NULL,
+                     utilization REAL NOT NULL,
+                     used_usd    REAL,
+                     max_usd     REAL,
+                     measured_at INTEGER NOT NULL,
+                     PRIMARY KEY (app_id, hour, tier)
+                 );",
+            )
+            .expect("legacy table");
+        }
+
+        let mut sample = tier("five_hour", 20.0);
+        sample.spend_usd = Some(12.0);
+        db.record_quota_history("claude", 10 * HOUR_MS, &[sample])
+            .expect("record");
+
+        let rows = db.get_quota_history(None, 0, 100).expect("query");
+        assert_eq!(rows[0].spend_usd, Some(12.0));
     }
 
     #[test]
