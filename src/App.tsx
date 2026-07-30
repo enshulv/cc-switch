@@ -46,6 +46,7 @@ import { hermesApi } from "@/lib/api/hermes";
 import type { ProviderEditorSave } from "@/lib/api/providers";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
+import { useQuotaHistoryProbe } from "@/hooks/useQuotaHistoryProbe";
 import {
   useTrayAppPageSeen,
   useTrayNavigation,
@@ -374,6 +375,8 @@ function App() {
   const providerScrollContainerRef = useRef<HTMLDivElement>(null);
 
   useUsageCacheBridge();
+  // 额度历史探针：每小时至少落一份订阅额度快照，供「额度趋势」回顾（附加功能）
+  useQuotaHistoryProbe({ visibleApps });
 
   useLayoutEffect(() => {
     if (currentView !== "providers") return;
