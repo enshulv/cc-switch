@@ -118,3 +118,4 @@ impl ToSql for AppType {
         self.as_str().to_sql()
     }
 }
+pub use quota_history::{QuotaHistoryRow, QuotaTierSample};
