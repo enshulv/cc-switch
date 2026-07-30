@@ -9,6 +9,8 @@ export interface QuotaHistoryRow {
   utilization: number;
   usedUsd: number | null;
   maxUsd: number | null;
+  /** 本机在该窗口内实测到的美元消耗；与 utilization 配对可反推窗口总额度 */
+  spendUsd: number | null;
 }
 
 /** 送给后端的单个窗口读数 */
@@ -17,6 +19,7 @@ export interface QuotaTierSample {
   utilization: number;
   usedUsd: number | null;
   maxUsd: number | null;
+  spendUsd: number | null;
 }
 
 export const quotaHistoryApi = {
