@@ -44,6 +44,7 @@ import { hermesApi } from "@/lib/api/hermes";
 import { useProxyStatus } from "@/hooks/useProxyStatus";
 import { useAutoCompact } from "@/hooks/useAutoCompact";
 import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
+import { useQuotaHistoryProbe } from "@/hooks/useQuotaHistoryProbe";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { useScanUnmanagedSkills } from "@/hooks/useSkills";
@@ -251,6 +252,8 @@ function App() {
   const isToolbarCompact = useAutoCompact(toolbarRef);
 
   useUsageCacheBridge();
+  // 额度历史探针：每小时至少落一份订阅额度快照，供「额度趋势」回顾（附加功能）
+  useQuotaHistoryProbe({ visibleApps });
 
   const promptPanelRef = useRef<any>(null);
   const mcpPanelRef = useRef<any>(null);
