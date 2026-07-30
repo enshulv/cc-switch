@@ -25,8 +25,24 @@ function row(
   hour: number,
   tier: string,
   utilization: number,
+  spendUsd: number | null = null,
 ): QuotaHistoryRow {
-  return { appId, hour, tier, utilization, usedUsd: null, maxUsd: null };
+  return {
+    appId,
+    hour,
+    tier,
+    utilization,
+    usedUsd: null,
+    maxUsd: null,
+    spendUsd,
+  };
+}
+
+/** 会收敛到 $1000 的三点序列（U 每步 +10，C 每步 +$100） */
+function convergingRows(appId: string, nowHour: number): QuotaHistoryRow[] {
+  return [10, 20, 30].map((u, i) =>
+    row(appId, nowHour - 2 + i, "five_hour", u, (u / 10) * 100),
+  );
 }
 
 function renderChart(appType: string) {
@@ -55,12 +71,9 @@ describe("QuotaTrendChart", () => {
     expect(await screen.findByText("该区间暂无额度记录")).toBeInTheDocument();
   });
 
-  it("renders the chart once the probe has recorded something", async () => {
+  it("renders the chart once the estimate has converged", async () => {
     const nowHour = Math.floor(Date.now() / 3_600_000);
-    query.mockResolvedValue([
-      row("claude", nowHour - 2, "five_hour", 30),
-      row("claude", nowHour - 1, "five_hour", 55),
-    ]);
+    query.mockResolvedValue(convergingRows("claude", nowHour));
 
     renderChart("claude");
 
@@ -77,12 +90,22 @@ describe("QuotaTrendChart", () => {
 
   it("falls back to the first app with history when the filter is 'all'", async () => {
     const nowHour = Math.floor(Date.now() / 3_600_000);
-    query.mockResolvedValue([row("codex", nowHour - 1, "five_hour", 30)]);
+    query.mockResolvedValue(convergingRows("codex", nowHour));
 
     renderChart("all");
 
     expect(await screen.findByText("codex")).toBeInTheDocument();
     expect(screen.queryByText("该区间暂无额度记录")).toBeNull();
+  });
+
+  it("explains warm-up instead of drawing an empty chart", async () => {
+    const nowHour = Math.floor(Date.now() / 3_600_000);
+    // 只有一个点，增量法还没到门槛
+    query.mockResolvedValue([row("claude", nowHour - 1, "five_hour", 10, 100)]);
+
+    renderChart("claude");
+
+    expect(await screen.findByText("额度估算尚未收敛")).toBeInTheDocument();
   });
 
   it("queries the whole hour range for every app at once", async () => {
