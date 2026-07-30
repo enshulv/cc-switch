@@ -21,8 +21,13 @@
  * kept as a lower-bound correction (all local data is a floor the true quota
  * can't fall below); the shown value is `max(delta, cumulative)`.
  *
- * State lives in a ref and is dropped on unmount (session close) — nothing is
- * persisted, so a stale window never lingers; it re-converges on reopen.
+ * The live hook's state lives in a ref and is dropped on unmount (session
+ * close), so it re-converges on reopen. The RAW inputs (C, U) are persisted
+ * hourly by `useQuotaHistoryProbe`, and `quotaHistory.replayTierEstimates`
+ * feeds them back through `foldQuotaSample` — the same single step this hook
+ * uses — to draw the quota-trend chart. Sharing that step keeps the two on the
+ * same algorithm; it does not make them agree instant-by-instant, because they
+ * fold at different sample rates (see `foldQuotaSample`).
  *
  * Depends only on stable contracts: `QuotaTier.utilization`, `resetsAt`, and
  * `usageApi.getModelStats`. No backend or SubscriptionQuota data-flow changes.
@@ -40,16 +45,21 @@ const DAY_MS = 86_400_000;
  * ── Tuning knobs ──────────────────────────────────────────────────────────
  * These trade responsiveness against stability. C (local spend) and U
  * (provider percentage) come from two unsynchronized sources and jitter by
- * ~1-2%, so most lean toward "steady". Each can be adjusted in isolation:
+ * ~1-2%. This is a single-user personal fork, so the tuning is deliberately
+ * biased toward **converging fast**, accepting a jumpier first few readings.
+ * Each knob can be adjusted in isolation:
  *
  * - MIN_OBSERVED_DU — gate (percentage points). Hold the estimate hidden until
- *   this much window movement (ΣΔU) has been observed THIS session, so the
- *   delta slope rests on enough signal. 5-10 is a good range.
+ *   this much window movement (ΣΔU) has been observed, so the delta slope rests
+ *   on some signal. At 2 the first number appears almost immediately; the cost
+ *   is that it rests on little evidence, which the fast EMA below then corrects.
  * - RESET_DROP_PCT — a utilization drop larger than this is treated as a window
  *   reset: the delta accumulators start a fresh segment.
  * - EMA_ALPHA — smoothing weight of each new sample (0..1). Higher = snappier
- *   but jumpier; lower = steadier but slower. An EMA at alpha a keeps ~1/a
- *   recent samples of "memory" (0.12 ≈ 8).
+ *   but jumpier; lower = steadier but slower. Residual error after n samples is
+ *   (1−α)^n, so at α=0.45 six samples leave ~3%. The footer refreshes every
+ *   5 min, so that is roughly half an hour to converge; the history chart
+ *   samples hourly, so it takes ~6 hours of recorded data instead.
  * - DISPLAY_DEADBAND_RATIO — hysteresis on the shown number. Hold the last
  *   figure until the EMA drifts past this fraction, then snap to it.
  * - TREND_EPS_RATIO — dead zone for the trend arrow. Moves within this fraction
@@ -61,9 +71,9 @@ const DAY_MS = 86_400_000;
  *   inference immediately — marked provisional — instead of hiding. The one
  *   decision is shared across all tiers so 5h and 7d light up together.
  */
-export const MIN_OBSERVED_DU = 5;
-const RESET_DROP_PCT = 20;
-const EMA_ALPHA = 0.12;
+export const MIN_OBSERVED_DU = 2;
+export const RESET_DROP_PCT = 20;
+const EMA_ALPHA = 0.45;
 const DISPLAY_DEADBAND_RATIO = 0.02;
 const TREND_EPS_RATIO = 0.08;
 export const PROVISIONAL_MIN_TOKENS = 500_000_000;
@@ -118,6 +128,32 @@ function sumCost(rows: ModelStats[], pred: (m: string) => boolean): number {
   return rows
     .filter((r) => pred(r.model))
     .reduce((acc, r) => acc + (Number.parseFloat(r.totalCost) || 0), 0);
+}
+
+/** Local spend feeding one tier's numerator, in dollars. */
+export function sumTierCost(rows: ModelStats[], tierName: string): number {
+  return sumCost(rows, tierModelPredicate(tierName));
+}
+
+/**
+ * Window start as Unix **seconds** (`resetsAt − window length`), or null when
+ * the tier has no known window or no reset time.
+ *
+ * `get_model_stats` takes seconds (see `resolveUsageRange`); passing millis
+ * pushes the range into the future and returns no spend, so the numerator
+ * silently becomes 0. Shared by the live hook and the hourly history probe so
+ * both measure the exact same interval.
+ */
+export function tierWindowStartSec(tier: {
+  name: string;
+  resetsAt: string | null;
+}): number | null {
+  const windowMs = tierWindowMs(tier.name);
+  if (windowMs == null || !tier.resetsAt) return null;
+  const start = Math.floor(
+    (new Date(tier.resetsAt).getTime() - windowMs) / 1000,
+  );
+  return Number.isFinite(start) ? start : null;
 }
 
 /**
@@ -203,11 +239,12 @@ export interface TierEstimate {
   loading: boolean;
 }
 
-interface TierAccum {
+/** Everything the estimator carries from one observation to the next. */
+export interface EstimatorState {
   /** Last observed local window spend and account utilization (for deltas). */
   prevC: number;
   prevU: number;
-  /** Accumulated positive deltas this session (a fresh segment resets these). */
+  /** Accumulated positive deltas (a fresh segment resets these). */
   sumDC: number;
   sumDU: number;
   /** Smoothed combined estimate; null until the gate is met. */
@@ -216,8 +253,84 @@ interface TierAccum {
   display: number | null;
   /** EMA before folding the current sample, used as the trend baseline. */
   baseline: number | null;
+}
+
+interface TierAccum extends EstimatorState {
   /** The quota.queriedAt already folded, to avoid folding the same snapshot twice. */
   lastQueriedAt: number;
+}
+
+/**
+ * Fold one (spend, utilization) observation into the estimator — the single
+ * step of the whole algorithm, kept pure so it has exactly one implementation.
+ *
+ * Two callers drive it: `useQuotaEstimates` streams live refreshes through it,
+ * and `quotaHistory.replayTierEstimates` replays a persisted hourly series
+ * through it. Sharing this guarantees both use the same ALGORITHM — it does NOT
+ * make them show the same number at the same moment, and they are not expected
+ * to: the fold is stateful and per-sample, and the two drivers sample at very
+ * different rates (footer ~5 min, history 1 h). The EMA therefore has ~40 min of
+ * memory in the footer and ~8 h in the chart, so right after a quota change the
+ * footer moves first and the chart lags. Treat the chart as an hourly-resolution
+ * view of the same estimator, not as a mirror of the footer.
+ *
+ * `allowProvisional` opens the bootstrap path: before the delta estimator has
+ * warmed up, accept the (low-biased) cumulative inference. The live hook gates
+ * it on having enough local token history; the historical replay leaves it off
+ * and simply shows nothing until the delta estimate converges.
+ */
+export function foldQuotaSample(
+  prev: EstimatorState | null,
+  costUsd: number,
+  utilization: number,
+  allowProvisional = false,
+): EstimatorState {
+  let sumDC = prev?.sumDC ?? 0;
+  let sumDU = prev?.sumDU ?? 0;
+  if (prev) {
+    const dU = utilization - prev.prevU;
+    const dC = costUsd - prev.prevC;
+    if (dU < -RESET_DROP_PCT) {
+      // Window reset: start a fresh accumulation segment.
+      sumDC = 0;
+      sumDU = 0;
+    } else if (dU > 0 && dC > 0) {
+      // Progress driven by local activity — the only intervals we trust.
+      // (dU>0 but dC<=0 means off-device-only usage; skip so it can't pollute.)
+      sumDC += dC;
+      sumDU += dU;
+    }
+  }
+
+  // Usage inference (delta, baseline-robust) is primary; before it warms up,
+  // bootstrap from the cold inference (cumulative) when allowed.
+  const deltaEst = deltaSlopeQuotaUsd(sumDC, sumDU);
+  const cumEst = cumulativeQuotaUsd(costUsd, utilization);
+  let instant: number | null = null;
+  if (deltaEst != null) {
+    instant = combineEstimates(deltaEst, cumEst);
+  } else if (allowProvisional && cumEst != null) {
+    instant = cumEst;
+  }
+
+  let ema = prev?.ema ?? null;
+  let display = prev?.display ?? null;
+  let baseline = prev?.baseline ?? null;
+  if (instant != null) {
+    baseline = ema ?? instant;
+    ema = foldEma(ema, instant);
+    display = applyDeadband(display, ema);
+  }
+
+  return {
+    prevC: costUsd,
+    prevU: utilization,
+    sumDC,
+    sumDU,
+    ema,
+    display,
+    baseline,
+  };
 }
 
 /**
@@ -241,13 +354,7 @@ export function useQuotaEstimates(
 
   const results = useQueries({
     queries: estimableTiers.map((t) => {
-      const windowMs = tierWindowMs(t.name)!;
-      // get_model_stats takes startDate/endDate as Unix seconds (see
-      // resolveUsageRange); divide by 1000, otherwise passing millis pushes the
-      // range far into the future and returns no spend → the numerator is 0.
-      const start = Math.floor(
-        (new Date(t.resetsAt as string).getTime() - windowMs) / 1000,
-      );
+      const start = tierWindowStartSec(t)!;
       const end = Math.floor(Date.now() / 1000);
       return {
         // queriedAt in the key: only recompute when the quota is re-fetched,
@@ -307,7 +414,7 @@ export function useQuotaEstimates(
       if (!rows) return null;
       return {
         t,
-        C: sumCost(rows, tierModelPredicate(t.name)),
+        C: sumTierCost(rows, t.name),
         U: t.utilization,
       };
     });
@@ -322,53 +429,10 @@ export function useQuotaEstimates(
       const rec = accumRef.current.get(key);
       if (rec && rec.lastQueriedAt === queriedAt) return; // already folded
 
-      // Accumulate deltas only when a previous point exists; the first
-      // observation still yields a cold estimate below (it needs C/U only, not
-      // a delta), so a single quota fetch already shows something.
-      let sumDC = rec?.sumDC ?? 0;
-      let sumDU = rec?.sumDU ?? 0;
-      if (rec) {
-        const dU = U - rec.prevU;
-        const dC = C - rec.prevC;
-        if (dU < -RESET_DROP_PCT) {
-          // Window reset: start a fresh accumulation segment.
-          sumDC = 0;
-          sumDU = 0;
-        } else if (dU > 0 && dC > 0) {
-          // Progress driven by local activity — the only intervals we trust.
-          // (dU>0 but dC<=0 means off-device-only usage; skip so it can't pollute.)
-          sumDC += dC;
-          sumDU += dU;
-        }
-      }
-
-      // Usage inference (delta, baseline-robust) is primary; before it warms up,
-      // bootstrap from the cold inference (cumulative) when local history is rich.
-      const deltaEst = deltaSlopeQuotaUsd(sumDC, sumDU);
-      const cumEst = cumulativeQuotaUsd(C, U);
-      let instant: number | null = null;
-      if (deltaEst != null) {
-        instant = combineEstimates(deltaEst, cumEst);
-      } else if (provisionalOK && cumEst != null) {
-        instant = cumEst;
-      }
-
-      let ema = rec?.ema ?? null;
-      let display = rec?.display ?? null;
-      let baseline = rec?.baseline ?? null;
-      if (instant != null) {
-        baseline = ema ?? instant;
-        ema = foldEma(ema, instant);
-        display = applyDeadband(display, ema);
-      }
+      // One shared step, also used by the historical replay in quotaHistory.ts
+      // — so the footer and the quota-trend chart can never disagree.
       accumRef.current.set(key, {
-        prevC: C,
-        prevU: U,
-        sumDC,
-        sumDU,
-        ema,
-        display,
-        baseline,
+        ...foldQuotaSample(rec ?? null, C, U, provisionalOK),
         lastQueriedAt: queriedAt,
       });
       changed = true;
