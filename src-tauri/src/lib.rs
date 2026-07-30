@@ -1812,6 +1812,9 @@ pub fn run() {
             commands::rebuild_codex_usage,
             commands::get_session_usage_last_sync,
             commands::fetch_exchange_rates,
+            // Quota history (fork)
+            commands::record_quota_history,
+            commands::get_quota_history,
             // Stream health check
             commands::stream_check_provider,
             // Session manager
