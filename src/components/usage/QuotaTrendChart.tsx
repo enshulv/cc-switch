@@ -1,10 +1,11 @@
 /**
  * Quota-trend chart (additive — reads only what the hourly probe recorded).
  *
- * Plots the utilization of each subscription window (5h / 7d / ...) over the
- * dashboard's selected date range, so a window that has long since reset can
- * still be reviewed after the fact. Rows come from the `fork_quota_history`
- * table via `useQuotaHistory`; the probe invalidates that query whenever a
+ * Plots the reverse-computed dollar quota of each subscription window (5h / 7d
+ * / ...) over the dashboard's selected date range, so a window that has long
+ * since reset can still be reviewed after the fact. Rows come from the
+ * `fork_quota_history` table via `useQuotaHistory` and are replayed through the
+ * estimator in `quotaHistory.ts`; the probe invalidates that query whenever a
  * reading adds something new.
  */
 import { useMemo, type ReactNode } from "react";
@@ -30,8 +31,7 @@ import {
   appsWithHistory,
   hourIndex,
   rowsToSeries,
-  usdMaxKey,
-  usdUsedKey,
+  utilKey,
 } from "./quotaHistory";
 
 interface QuotaTrendChartProps {
@@ -85,7 +85,7 @@ export function QuotaTrendChart({
     return appsWithHistory(history ?? [], PROBE_APPS)[0] ?? PROBE_APPS[0];
   }, [appType, history]);
 
-  const { tiers, rows } = useMemo(
+  const { tiers, rows, warmingUp, estimable } = useMemo(
     () => rowsToSeries(history ?? [], appId),
     [history, appId],
   );
@@ -115,8 +115,7 @@ export function QuotaTrendChart({
         <p className="mb-2 font-medium">{formatTs(label)}</p>
         {payload.map((entry: any, index: number) => {
           if (entry.value == null) return null;
-          const used = row[usdUsedKey(entry.dataKey)];
-          const max = row[usdMaxKey(entry.dataKey)];
+          const util = row[utilKey(entry.dataKey)];
           return (
             <div
               key={index}
@@ -128,11 +127,15 @@ export function QuotaTrendChart({
                 style={{ backgroundColor: entry.color }}
               />
               <span className="font-medium">{entry.name}:</span>
-              <span className="tabular-nums">{entry.value.toFixed(1)}%</span>
-              {used != null && (
-                <span className="text-muted-foreground">
-                  (${used.toFixed(2)}
-                  {max != null ? ` / $${max.toFixed(2)}` : ""})
+              <span className="tabular-nums">
+                {t("subscription.estQuota", {
+                  value: `$${Math.round(entry.value)}`,
+                  defaultValue: `额度 $${Math.round(entry.value)} est.`,
+                })}
+              </span>
+              {util != null && (
+                <span className="text-muted-foreground tabular-nums">
+                  ({util.toFixed(1)}%)
                 </span>
               )}
             </div>
@@ -162,17 +165,35 @@ export function QuotaTrendChart({
           <div className="flex h-full items-center justify-center">
             <Loader2 className="h-8 w-8 animate-spin text-muted-foreground/30" />
           </div>
-        ) : tiers.length === 0 ? (
+        ) : tiers.length === 0 || !estimable || warmingUp ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <History className="h-8 w-8 text-muted-foreground/30" />
             <p className="text-sm text-muted-foreground">
-              {t("usage.quotaTrendEmpty", "该区间暂无额度记录")}
+              {/* 三态必须分开：「没记录」还能等，「算不出」等一辈子也没用。 */}
+              {tiers.length === 0
+                ? t("usage.quotaTrendEmpty", "该区间暂无额度记录")
+                : !estimable
+                  ? t(
+                      "usage.quotaTrendNotEstimable",
+                      "该区间的记录无法反推额度",
+                    )
+                  : t("usage.quotaTrendWarmingUp", "额度估算尚未收敛")}
             </p>
             <p className="max-w-md text-xs text-muted-foreground/70">
-              {t(
-                "usage.quotaTrendHint",
-                "额度探针每小时记录一次订阅窗口用量，保持应用运行即可逐步累积历史。",
-              )}
+              {tiers.length === 0
+                ? t(
+                    "usage.quotaTrendHint",
+                    "额度探针每小时记录一次订阅窗口用量，保持应用运行即可逐步累积历史。",
+                  )
+                : !estimable
+                  ? t(
+                      "usage.quotaTrendNotEstimableHint",
+                      "反推额度需要本机实测消耗，目前仅 Claude 与 Codex 的固定窗口支持；旧版本记录的数据也缺少这项，无法补算。",
+                    )
+                  : t(
+                      "usage.quotaTrendWarmingUpHint",
+                      "额度靠「本机实测消耗 ÷ 已用百分比」反推，需要观察到足够的窗口移动量才出数。继续用一段时间即可。",
+                    )}
             </p>
           </div>
         ) : (
@@ -200,11 +221,10 @@ export function QuotaTrendChart({
                 dy={10}
               />
               <YAxis
-                domain={[0, 100]}
                 axisLine={false}
                 tickLine={false}
                 tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 12 }}
-                tickFormatter={(value) => `${value}%`}
+                tickFormatter={(value) => `$${Math.round(value)}`}
               />
               <Tooltip content={<CustomTooltip />} />
               <Legend />

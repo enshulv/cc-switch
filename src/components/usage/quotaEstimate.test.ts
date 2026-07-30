@@ -10,6 +10,8 @@ import {
   classifyTrend,
   isEstimableApp,
   MIN_OBSERVED_DU,
+  tierWindowStartSec,
+  foldQuotaSample,
 } from "./quotaEstimate";
 
 const HOUR = 3_600_000;
@@ -148,5 +150,69 @@ describe("isEstimableApp", () => {
     expect(isEstimableApp("codex")).toBe(true);
     expect(isEstimableApp("gemini")).toBe(false);
     expect(isEstimableApp(undefined)).toBe(false);
+  });
+});
+
+describe("tierWindowStartSec", () => {
+  it("returns Unix SECONDS, not millis", () => {
+    // 这个函数存在的唯一理由就是这个陷阱：get_model_stats 收秒，传毫秒会把区间
+    // 推到未来、查不到任何消耗，C 静默变 0，页脚和图表一起变空白。
+    const resetsAt = new Date(1_800_000_000_000).toISOString();
+    const start = tierWindowStartSec({ name: "five_hour", resetsAt })!;
+    expect(start).toBe(1_800_000_000 - 5 * 3600);
+    // 秒级时间戳在 2001-2286 年间是 10 位数；毫秒是 13 位
+    expect(String(start).length).toBe(10);
+  });
+
+  it("returns null for windows with no known length or no reset time", () => {
+    expect(
+      tierWindowStartSec({
+        name: "gemini_pro",
+        resetsAt: new Date().toISOString(),
+      }),
+    ).toBeNull();
+    expect(
+      tierWindowStartSec({ name: "five_hour", resetsAt: null }),
+    ).toBeNull();
+    expect(
+      tierWindowStartSec({ name: "five_hour", resetsAt: "not a date" }),
+    ).toBeNull();
+  });
+});
+
+describe("foldQuotaSample", () => {
+  it("needs a previous sample before the delta estimator can gate open", () => {
+    const first = foldQuotaSample(null, 100, 10);
+    expect(first.display).toBeNull();
+    expect(first.prevC).toBe(100);
+    expect(first.prevU).toBe(10);
+  });
+
+  it("converges on the slope, not on the cumulative ratio", () => {
+    // 账号在别处已烧掉基数：累积法给 100·100/50 = $200，增量法给 100·100/10 = $1000。
+    const first = foldQuotaSample(null, 100, 50);
+    const second = foldQuotaSample(first, 200, 60);
+    expect(second.display).toBeCloseTo(1000, 6);
+  });
+
+  it("drops intervals with window movement but no local spend", () => {
+    const first = foldQuotaSample(null, 100, 10);
+    const offDevice = foldQuotaSample(first, 100, 30); // ΔU=20, ΔC=0
+    expect(offDevice.sumDU).toBe(0);
+    expect(offDevice.display).toBeNull();
+  });
+
+  it("clears the accumulators when the window resets", () => {
+    const a = foldQuotaSample(null, 100, 40);
+    const b = foldQuotaSample(a, 200, 50);
+    expect(b.sumDU).toBe(10);
+    const afterReset = foldQuotaSample(b, 10, 2); // U 骤降 → 重置
+    expect(afterReset.sumDU).toBe(0);
+    expect(afterReset.sumDC).toBe(0);
+  });
+
+  it("only accepts the cumulative bootstrap when provisional is allowed", () => {
+    expect(foldQuotaSample(null, 100, 50).display).toBeNull();
+    expect(foldQuotaSample(null, 100, 50, true).display).toBeCloseTo(200, 6);
   });
 });
