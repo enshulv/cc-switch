@@ -57,6 +57,8 @@ import { getUsageRangePresetLabel, resolveUsageRange } from "@/lib/usageRange";
 import { cn } from "@/lib/utils";
 import { UsageHero } from "./UsageHero";
 import { UsageTrendChart } from "./UsageTrendChart";
+import { QuotaTrendChart } from "./QuotaTrendChart";
+import { PROBE_APPS } from "@/hooks/useQuotaHistoryProbe";
 import { RequestLogTable } from "./RequestLogTable";
 import { ProviderStatsTable } from "./ProviderStatsTable";
 import { ModelStatsTable } from "./ModelStatsTable";
@@ -955,6 +957,12 @@ export function UsageDashboard({
       className="flex min-h-0 flex-1 flex-col gap-8 overflow-y-auto scroll-stable px-6 pb-6 pt-1"
     >
       {overviewPanel}
+      {/* Fork：订阅额度趋势（只对有订阅额度的应用，或「全部」） */}
+      {(!appType ||
+        appType === "all" ||
+        (PROBE_APPS as readonly string[]).includes(appType)) && (
+        <QuotaTrendChart range={range} appType={appType} />
+      )}
       {detailPanel}
     </div>
   );

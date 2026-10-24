@@ -41,10 +41,10 @@ interface SubscriptionQuotaViewProps {
   /** 查询成功但一档都没有时写的一句（Kimi 没订阅的号返回空对象）；不给时不显示 */
   emptyText?: string;
   /**
-   * Fork: appId that enables the estimated-dollar-quota line (only "claude" /
-   * "codex"). Omitted → no estimate, the upstream display is untouched.
+   * Fork: the estimated-dollar-quota line (`useQuotaEstimateLine`), drawn under
+   * the card column. Omitted → the upstream display is untouched.
    */
-  estimateAppId?: string;
+  estimateLine?: React.ReactNode;
 }
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
@@ -76,7 +76,7 @@ export const TIER_I18N_KEYS: Record<string, string> = {
 };
 
 /** 卡片上不显示的档（展开时仍列出） */
-const HIDDEN_INLINE_TIERS = new Set(["seven_day_sonnet"]);
+export const HIDDEN_INLINE_TIERS = new Set(["seven_day_sonnet"]);
 
 /**
  * 卡片上按组只留剩余最少的一档、标签写组名（展开时仍逐档列出）：
@@ -236,13 +236,9 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   inline = false,
   display = "left",
   emptyText,
-  estimateAppId,
+  estimateLine,
 }) => {
   const { t, i18n } = useTranslation();
-  const estimateLine = useQuotaEstimateLine(estimateAppId, quota, {
-    label: (name) => tierShortLabel(t, name),
-    hidden: HIDDEN_INLINE_TIERS,
-  });
 
   // 无凭据 / 凭据解析错误 → 不显示（静默）
   if (!quota || quota.credentialStatus === "not_found") return null;
@@ -389,6 +385,10 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
     isCurrent && autoQueryInterval > 0,
     autoQueryInterval,
   );
+  const estimateLine = useQuotaEstimateLine(appId, quota, {
+    label: tierShortLabel,
+    hidden: HIDDEN_INLINE_TIERS,
+  });
 
   if (!isCurrent) return null;
 
@@ -401,7 +401,7 @@ const SubscriptionQuotaFooter: React.FC<SubscriptionQuotaFooterProps> = ({
       appIdForExpiredHint={appId === "grokbuild" ? "grok" : appId}
       inline={inline}
       display={display}
-      estimateAppId={appId}
+      estimateLine={estimateLine}
     />
   );
 };
