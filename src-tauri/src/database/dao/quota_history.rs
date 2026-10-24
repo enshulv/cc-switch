@@ -215,14 +215,12 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     const HOUR_MS: i64 = 3_600_000;
 
+    // Upstream's constructor, so new `Database` fields never break this test.
     fn db() -> Database {
-        Database {
-            conn: Mutex::new(Connection::open_in_memory().expect("open memory db")),
-        }
+        Database::memory().expect("open memory db")
     }
 
     fn tier(name: &str, utilization: f64) -> QuotaTierSample {
@@ -238,14 +236,17 @@ mod tests {
     #[test]
     fn creates_its_table_without_touching_user_version() {
         let db = db();
+        let user_version = |db: &Database| -> i32 {
+            let conn = db.conn.lock().expect("lock");
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("user_version")
+        };
+        let before = user_version(&db);
+
         db.record_quota_history("claude", 10 * HOUR_MS, &[tier("five_hour", 20.0)])
             .expect("record");
 
-        let conn = db.conn.lock().expect("lock");
-        let version: i32 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .expect("user_version");
-        assert_eq!(version, 0, "本表不得改动迁移链的版本号");
+        assert_eq!(user_version(&db), before, "本表不得改动迁移链的版本号");
     }
 
     #[test]
