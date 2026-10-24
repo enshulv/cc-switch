@@ -2220,6 +2220,13 @@
     "source": "Kaynak",
     "requestsLabel": "istekler",
     "costLabel": "toplam maliyet",
+    "quotaTrends": "Kota eğilimi",
+    "quotaTrendEmpty": "Bu aralıkta kota kaydı yok",
+    "quotaTrendWarmingUp": "Kota tahmini henüz oturmadı",
+    "quotaTrendWarmingUpHint": "Kota, «yerel harcama ÷ kullanılan yüzde» ile geriye doğru hesaplanır; bir sayı göstermek için pencerede yeterli hareket görülmesi gerekir. Bir süre kullanmaya devam edin.",
+    "quotaTrendNotEstimable": "Bu aralıktaki kayıtlardan kota hesaplanamıyor",
+    "quotaTrendNotEstimableHint": "Kotayı geriye doğru hesaplamak yerel harcama ölçümü gerektirir; şu an yalnızca Claude ve Codex'in sabit pencereleri destekleniyor. Eski sürümlerin kayıtlarında bu veri yok ve sonradan hesaplanamaz.",
+    "quotaTrendHint": "Kota yoklayıcısı abonelik pencerelerinin kullanımını saatte bir kaydeder; uygulamayı açık tuttukça geçmiş birikir.",
     "appFilter": {
       "all": "Tümü",
       "claude": "Claude Code",

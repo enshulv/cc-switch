@@ -1,7 +1,12 @@
 import React from "react";
 import type { ProviderMeta } from "@/types";
 import { useCodexOauthQuota } from "@/lib/query/subscription";
-import { SubscriptionQuotaView } from "@/components/SubscriptionQuotaFooter";
+import {
+  HIDDEN_INLINE_TIERS,
+  SubscriptionQuotaView,
+  tierShortLabel,
+} from "@/components/SubscriptionQuotaFooter";
+import { useQuotaEstimateLine } from "@/components/usage/QuotaEstimateLine";
 import { useQuotaDisplay } from "@/components/quota/useQuotaDisplay";
 
 interface CodexOauthQuotaFooterProps {
@@ -34,6 +39,10 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
     autoQuery: isCurrent && autoQueryInterval > 0,
     autoQueryIntervalMinutes: autoQueryInterval,
   });
+  const estimateLine = useQuotaEstimateLine("codex", quota, {
+    label: tierShortLabel,
+    hidden: HIDDEN_INLINE_TIERS,
+  });
 
   return (
     <SubscriptionQuotaView
@@ -43,7 +52,7 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
       appIdForExpiredHint="codex_oauth"
       inline={inline}
       display={display}
-      estimateAppId="codex"
+      estimateLine={estimateLine}
     />
   );
 };

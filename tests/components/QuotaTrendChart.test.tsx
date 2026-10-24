@@ -51,11 +51,7 @@ function renderChart(appType: string) {
   });
   return render(
     <QueryClientProvider client={client}>
-      <QuotaTrendChart
-        range={{ preset: "7d" }}
-        rangeLabel="7d"
-        appType={appType}
-      />
+      <QuotaTrendChart range={{ preset: "7d" }} appType={appType} />
     </QueryClientProvider>,
   );
 }

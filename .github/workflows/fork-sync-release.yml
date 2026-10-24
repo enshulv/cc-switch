@@ -120,8 +120,20 @@ jobs:
         with:
           node-version: "20"
 
+      # Same as upstream's release.yml: rust-toolchain.toml is the only source of
+      # the compiler version.
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          test -n "$channel"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -211,7 +223,7 @@ jobs:
           body: |
             Automated personal-fork build, rebased on upstream **farion1231/cc-switch**.
 
-            **Difference from upstream:** inline estimated dollar quota per window in the subscription / usage footer.
+            **Difference from upstream:** estimated dollar quota per window under the subscription quota on provider cards, and an hourly quota-trend panel on the usage page.
 
             The in-app updater on this fork points here, so installed fork builds update from this repo (Windows x64).
           files: |
