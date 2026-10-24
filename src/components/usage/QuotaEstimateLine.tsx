@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import type { SubscriptionQuota } from "@/types/subscription";
 import { useMoneyFormat } from "@/hooks/useMoneyFormat";
@@ -8,11 +9,12 @@ import { useQuotaEstimates } from "@/components/usage/quotaEstimate";
  * Fork-only: the reverse-computed dollar quota per window, rendered as one
  * muted line under the card's quota column ("Est. quota 5h $180 · Weekly $1234").
  *
- * Kept in its own file and exposed as a hook so the upstream-owned
- * `SubscriptionQuotaView` only needs two touch points (call + render), which
- * keeps the fork's rebases onto upstream cheap. The hook must run on every
- * render of the view (not only in the success branch) so the estimator's
- * accumulated deltas survive a transient failed refresh.
+ * Kept in its own file so the upstream-owned quota components need only small
+ * touch points, which keeps the fork's rebases onto upstream cheap. The thin
+ * footer wrappers call this hook (they are always mounted and already sit under
+ * a QueryClient) and hand the node to `SubscriptionQuotaView` as a prop; the
+ * view itself stays hook-free, so upstream tests that render it bare still
+ * pass, and the estimator's accumulated deltas survive a failed refresh.
  *
  * Returns null until at least one window's estimate has passed its gate, and
  * always for apps other than Claude / Codex.
@@ -25,7 +27,7 @@ export function useQuotaEstimateLine(
     hidden,
   }: {
     /** Short window name for a tier ("5h" / "Weekly"). */
-    label: (tierName: string) => string;
+    label: (t: TFunction, tierName: string) => string;
     /** Tiers the card column hides; their estimate is not shown either. */
     hidden?: ReadonlySet<string>;
   },
@@ -38,7 +40,7 @@ export function useQuotaEstimateLine(
     .filter((tier) => !hidden?.has(tier.name))
     .flatMap((tier) => {
       const usd = estimates.get(tier.name)?.quotaUsd;
-      return usd == null ? [] : [`${label(tier.name)} ${money(usd, 0)}`];
+      return usd == null ? [] : [`${label(t, tier.name)} ${money(usd, 0)}`];
     });
   if (parts.length === 0) return null;
 
