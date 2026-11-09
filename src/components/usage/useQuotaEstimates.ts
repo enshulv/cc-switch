@@ -8,6 +8,7 @@ import {
   foldQuotaSample,
   isEstimableApp,
   PROVISIONAL_MIN_TOKENS,
+  seededEstimator,
   sumTierCost,
   tierWindowMs,
   tierWindowStartSec,
@@ -29,22 +30,11 @@ export interface TierEstimate {
 }
 
 interface TierAccum extends EstimatorState {
-  /** The quota.queriedAt already folded, to avoid folding the same snapshot twice. */
-  lastQueriedAt: number;
-}
-
-/** A state with no segment yet whose estimate starts at `seed`. */
-function seededState(seed: number): EstimatorState {
-  return {
-    prevC: null,
-    anchorU: null,
-    pendingDC: 0,
-    spans: [],
-    stale: null,
-    ema: seed,
-    display: seed,
-    baseline: seed,
-  };
+  /**
+   * The quota.queriedAt already folded, to avoid folding the same snapshot
+   * twice; null while the record only holds the history seed.
+   */
+  lastQueriedAt: number | null;
 }
 
 /**
@@ -53,8 +43,9 @@ function seededState(seed: number): EstimatorState {
  * Returns `Map<tierName, TierEstimate>`, containing only tiers with a known
  * window length and a reset time still in the future. The estimator state lives
  * in a ref and is dropped on unmount. On mount each tier starts from the latest
- * estimate in the last 14 days of quota history, when there is one; live
- * samples are not folded until that history query has settled.
+ * estimate in the last 14 days of quota history, when there is one, and shows
+ * it even before a measurable live sample arrives. Live samples are not folded
+ * while the history query is loading (`isLoading`).
  */
 export function useQuotaEstimates(
   appId: string | undefined,
@@ -137,19 +128,25 @@ export function useQuotaEstimates(
     windows.forEach(({ tier }, i) => {
       const rows = results[i]?.data;
       if (!rows) return;
+      const key = `${appId}:${tier.name}`;
+      let rec = accumRef.current.get(key);
+      if (!rec) {
+        const seed = seedFor(tier.name);
+        if (seed != null) {
+          rec = { ...seededEstimator(seed), lastQueriedAt: null };
+          accumRef.current.set(key, rec);
+          changed = true;
+        }
+      }
+
       const C = sumTierCost(rows, tier.name);
       const U = tier.utilization;
       if (!(C > 0) || !(U > 0)) return; // nothing measurable yet
+      if (rec?.lastQueriedAt === queriedAt) return; // already folded
 
-      const key = `${appId}:${tier.name}`;
-      const rec = accumRef.current.get(key);
-      if (rec && rec.lastQueriedAt === queriedAt) return; // already folded
-
-      const seed = rec ? undefined : seedFor(tier.name);
-      const start = rec ?? (seed != null ? seededState(seed) : null);
       // `provisionalOK` is shared across tiers so 5h and 7d appear together.
       accumRef.current.set(key, {
-        ...foldQuotaSample(start, C, U, provisionalOK),
+        ...foldQuotaSample(rec ?? null, C, U, provisionalOK),
         lastQueriedAt: queriedAt,
       });
       changed = true;
