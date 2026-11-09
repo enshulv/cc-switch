@@ -23,7 +23,8 @@
  *
  * Q is an account-level dollar figure, independent of any one window, so the
  * estimate survives window resets and recording gaps; only the span state is
- * cleared there (`startNewSegment`).
+ * cleared. `foldQuotaSample` detects resets itself; a recording gap is marked
+ * by the caller with `startNewSegment`.
  *
  * The live hook (`useQuotaEstimates`) streams refreshes through
  * `foldQuotaSample`, and `quotaHistory.replayTierEstimates` replays the hourly
@@ -48,9 +49,17 @@ const DAY_MS = 86_400_000;
  * - SPAN_KEEP_PP / MAX_SPANS — how much span history is kept. At 10 points of
  *   age a span weighs about 1%, so older spans cannot move the estimate
  *   visibly.
- * - RESET_DROP_PCT — a utilization drop larger than this is treated as a window
- *   reset: the spans are cleared, the estimate is kept. A smaller drop counts
- *   as a reset only when C falls with it.
+ * - JITTER_PP / RESET_C_DROP_USD — window-reset detection. U falling by more
+ *   than JITTER_PP points, or C falling by more than RESET_C_DROP_USD dollars,
+ *   is a reset: the spans are cleared, the estimate is kept. C only grows
+ *   within a window, so smaller falls of C are measurement noise; a one-point
+ *   fall of U is provider jitter.
+ * - STALE_RATIO / RESET_DROP_PCT — when C did not fall at a reset, it may still
+ *   count the previous window. Correctly measured C keeps 100·C/U ≤ Q, and a
+ *   whole-number U at most doubles that ratio (U=1 may really be 1.99), while
+ *   other machines can pull the estimate down to about a third of Q. So a ratio
+ *   above STALE_RATIO times the estimate marks C as stale. With no estimate
+ *   yet, only a U drop larger than RESET_DROP_PCT does.
  * - EMA_ALPHA — smoothing weight of each new sample (0..1). Higher = snappier
  *   but jumpier; lower = steadier but slower. Residual error after n samples is
  *   (1−α)^n, so at α=0.5 five samples leave ~3%. The footer refreshes every
@@ -70,6 +79,9 @@ const DAY_MS = 86_400_000;
 export const RECENCY_HALF_LIFE_PP = 1.5;
 const SPAN_KEEP_PP = 10;
 const MAX_SPANS = 64;
+const JITTER_PP = 1;
+const RESET_C_DROP_USD = 0.5;
+const STALE_RATIO = 4;
 export const RESET_DROP_PCT = 20;
 const EMA_ALPHA = 0.5;
 const DISPLAY_DEADBAND_RATIO = 0.02;
@@ -239,12 +251,46 @@ export function startNewSegment(
   prev: EstimatorState | null,
 ): EstimatorState | null {
   if (prev == null) return null;
-  // Rows recorded while the probe still measured C against an expired
-  // `resetsAt` carry the old window's spend for days, across gaps; dropping
-  // the marker there turns those rows into C/U spikes. New rows cannot enter
-  // that state: `tierWindowStartSec` returns null for an expired window, so no
-  // spend is recorded.
+  // The history can hold rows measured from an expired window start; their C
+  // keeps counting the previous window for days, across gaps. Dropping the
+  // stale marker at a gap would turn those rows into C/U spikes.
   return { ...prev, prevC: null, anchorU: null, pendingDC: 0, spans: [] };
+}
+
+/** A state with no segment yet whose estimate starts at `seed`. */
+export function seededEstimator(seed: number): EstimatorState {
+  return {
+    prevC: null,
+    anchorU: null,
+    pendingDC: 0,
+    spans: [],
+    stale: null,
+    ema: seed,
+    display: seed,
+    baseline: seed,
+  };
+}
+
+/**
+ * U falling past provider jitter, or C falling past measurement noise, means
+ * the window rolled over. `dU` is measured from the anchor, `dC` from the
+ * previous C.
+ */
+function isWindowReset(dU: number, dC: number): boolean {
+  return dC < -RESET_C_DROP_USD || dU < -JITTER_PP;
+}
+
+/** Whether C, after a reset, still counts the previous window (see STALE_RATIO). */
+function carriesPreviousWindow(
+  ema: number | null,
+  dU: number,
+  dC: number,
+  costUsd: number,
+  utilization: number,
+): boolean {
+  if (dC < -RESET_C_DROP_USD) return false;
+  if (ema == null) return dU < -RESET_DROP_PCT;
+  return (100 * costUsd) / utilization > STALE_RATIO * ema;
 }
 
 /** 100 · Σ(w·dC) ÷ Σ(w·dU), each span weighted by the points of newer spans. */
@@ -352,15 +398,12 @@ export function foldQuotaSample(
   if (prev?.prevC != null && prev.anchorU != null) {
     const dU = utilization - prev.anchorU;
     const dC = costUsd - prev.prevC;
-    // C only grows within a window, so U falling together with C can only be
-    // a reset, however small the drop; 5h windows often reset below 20%.
-    const largeDrop = dU < -RESET_DROP_PCT;
-    if (largeDrop || (dU < 0 && dC < 0)) {
+    if (isWindowReset(dU, dC)) {
       spans = [];
       pendingDC = 0;
-      if (largeDrop && dC >= 0) {
-        // The window reset but C did not fall with it: its window start is
-        // still the old one, so C/U would be wildly inflated.
+      if (carriesPreviousWindow(estimate.ema, dU, dC, costUsd, utilization)) {
+        // C/U would be wildly inflated; hold everything until C is measured
+        // against the new window.
         return {
           ...estimate,
           prevC: prev.prevC,
@@ -371,8 +414,8 @@ export function foldQuotaSample(
         };
       }
     } else if (dU <= 0) {
-      // U has not stepped; small drops with C still rising are jitter and must
-      // not lower the anchor, or 52 → 51 → 52 would count as a step.
+      // U has not stepped. A jitter drop must not lower the anchor, or
+      // 52 → 51 → 52 would count as a step; a noise drop of C is not spend.
       pendingDC += Math.max(dC, 0);
       anchorU = prev.anchorU;
     } else {
@@ -384,6 +427,7 @@ export function foldQuotaSample(
     }
   }
 
+  spans = trimSpans(spans);
   const instant = instantEstimate(
     spans,
     costUsd,
@@ -396,7 +440,7 @@ export function foldQuotaSample(
     prevC: costUsd,
     anchorU,
     pendingDC,
-    spans: trimSpans(spans),
+    spans,
     stale: null,
   };
 }

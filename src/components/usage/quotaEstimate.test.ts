@@ -10,8 +10,8 @@ import {
   tierWindowStartSec,
   foldQuotaSample,
   startNewSegment,
+  seededEstimator,
   RECENCY_HALF_LIFE_PP,
-  RESET_DROP_PCT,
   type EstimatorState,
 } from "./quotaEstimate";
 
@@ -202,7 +202,8 @@ function lastOf<T>(items: T[]): T {
   return items[items.length - 1];
 }
 
-const recencyWeight = (age: number) => 0.5 ** (age / RECENCY_HALF_LIFE_PP);
+/** 契约的权重公式，半衰期写成字面量 1.5pp，不取被测模块的常数 */
+const recencyWeight = (age: number) => 0.5 ** (age / 1.5);
 
 describe("foldQuotaSample", () => {
   it("opens a segment on the first sample without producing an estimate", () => {
@@ -257,7 +258,7 @@ describe("foldQuotaSample", () => {
     expect(states[2].spans).toHaveLength(1);
     expect(states[2].spans[0].dU).toBe(9);
     expect(states[2].spans[0].dC).toBeCloseTo(70.4, 9);
-    // 两段合计 19 格；存回时只留覆盖 10 格的最新一段（裁剪在估算之后）
+    // 两段合计 19 格；丢掉最旧的 9 格后仍覆盖 10 格，所以只留最新一段
     const final = lastOf(states);
     expect(final.spans).toHaveLength(1);
     expect(final.spans[0].dU).toBe(10);
@@ -289,41 +290,140 @@ describe("foldQuotaSample", () => {
     expect(lastOf(final.spans).dU).toBe(10);
     expect(lastOf(final.spans).dC).toBeCloseTo(101.4, 9);
 
-    // 最后一步的估算用到全部三段（裁剪在估算之后）
-    const recent =
-      (100 * (101.4 + 75.9 * recencyWeight(10) + 5.3 * recencyWeight(18))) /
-      (10 + 8 * recencyWeight(10) + 1 * recencyWeight(18));
-    const instant = Math.max(recent, (190.6 / 20) * 100);
-    expect(final.baseline).not.toBeNull();
-    expect(final.ema).toBeCloseTo(
-      final.baseline! + 0.5 * (instant - final.baseline!),
-      6,
-    );
-    expect(final.display).toBeLessThan(1100);
+    // 手算 EMA（α=0.5）：
+    //   第 3 步只有 {5.3, 1}：recent 530，下界 100·13.3/2 = 665，EMA 665；
+    //   第 4 步 {5.3, 1}、{75.9, 8}：recent = 100·(75.9 + 5.3·2^(−16/3)) ÷ (8 + 2^(−16/3))
+    //     ≈ 947.456，EMA ≈ 806.228；
+    //   第 5 步先裁剪，只剩 {101.4, 10}：recent 1014，下界 953，EMA ≈ 910.114。
+    // 不裁剪就估算的话三段都带权重，EMA ≈ 909.853。
+    expect(final.ema).toBeCloseTo(910.114, 2);
+    expect(final.display).toBeCloseTo(910.114, 2);
   });
 
-  it("does not treat falling C alone as a reset while U holds", () => {
-    const states = foldEach(null, [
-      [100, 30],
-      [110, 31],
-      [105, 31],
-    ]);
-    const after = lastOf(states);
-    expect(after.anchorU).toBe(31);
-    expect(after.spans).toEqual([{ dC: 10, dU: 1 }]);
-    expect(after.prevC).toBe(105);
-  });
-
-  it("treats a drop of exactly RESET_DROP_PCT as jitter, not a reset", () => {
-    const after = lastOf(
+  it("treats a drop of one point as jitter and a drop of two as a reset", () => {
+    const jitter = lastOf(
       foldEach(null, [
         [100, 50],
-        [110, 50 - RESET_DROP_PCT],
+        [110, 49],
       ]),
     );
-    expect(after.anchorU).toBe(50);
-    expect(after.pendingDC).toBe(10);
-    expect(after.stale).toBeNull();
+    expect(jitter.anchorU).toBe(50);
+    expect(jitter.pendingDC).toBe(10);
+
+    const reset = lastOf(
+      foldEach(null, [
+        [100, 50],
+        [110, 48],
+      ]),
+    );
+    expect(reset).toEqual(estimator({ prevC: 110, anchorU: 48 }));
+  });
+
+  it("treats C falling by more than $0.5 as a reset whichever way U moves", () => {
+    const base = estimator({
+      prevC: 100,
+      anchorU: 30,
+      pendingDC: 4,
+      spans: [{ dC: 10, dU: 1 }],
+      ema: 1000,
+      display: 1000,
+      baseline: 1000,
+    });
+    const reset = estimator({
+      prevC: 99.4,
+      ema: 1000,
+      display: 1000,
+      baseline: 1000,
+    });
+    expect(foldQuotaSample(base, 99.4, 30)).toEqual({ ...reset, anchorU: 30 });
+    expect(foldQuotaSample(base, 99.4, 34)).toEqual({ ...reset, anchorU: 34 });
+  });
+
+  it("treats C falling by $0.5 or less as measurement noise", () => {
+    const base = estimator({
+      prevC: 100,
+      anchorU: 30,
+      pendingDC: 4,
+      spans: [{ dC: 10, dU: 1 }],
+    });
+    // U 没跳格：负的 dC 不从累积里扣
+    const held = foldQuotaSample(base, 99.6, 30);
+    expect(held.pendingDC).toBe(4);
+    expect(held.anchorU).toBe(30);
+    expect(held.spans).toEqual([{ dC: 10, dU: 1 }]);
+    expect(held.prevC).toBe(99.6);
+
+    // U 跳格：结算的只有之前累积的 $4，负的 dC 不扣
+    const stepped = foldQuotaSample(base, 99.6, 31);
+    expect(stepped.spans).toEqual([
+      { dC: 10, dU: 1 },
+      { dC: 4, dU: 1 },
+    ]);
+    expect(stepped.pendingDC).toBe(0);
+  });
+
+  it("re-anchors on a small drop of U with C still rising", () => {
+    // 多机：旧窗口本机只花了 $2，别台机器把 U 推到 18；新窗口本机先用，C 比旧窗口末尾高。
+    // 真实额度 $100（$1/pp）。不当重置的话锚点卡在 18，U=19 时结算出 {17, 1}。
+    const prev = estimator({
+      prevC: 2,
+      anchorU: 18,
+      ema: 100,
+      display: 100,
+      baseline: 100,
+    });
+    const states = foldEach(prev, [
+      [3, 3],
+      [18, 18],
+      [19, 19],
+    ]);
+    expect(states[0]).toEqual({ ...prev, prevC: 3, anchorU: 3 });
+    expect(lastOf(states).display).toBeCloseTo(100, 6);
+  });
+
+  it("enters stale on a reset with no estimate only when U drops by more than 20 points", () => {
+    const stale = lastOf(
+      foldEach(null, [
+        [100, 50],
+        [110, 29],
+      ]),
+    );
+    expect(stale).toEqual(
+      estimator({ prevC: 100, anchorU: 29, stale: { refC: 100 } }),
+    );
+
+    const reset = lastOf(
+      foldEach(null, [
+        [100, 50],
+        [110, 30],
+      ]),
+    );
+    expect(reset).toEqual(estimator({ prevC: 110, anchorU: 30 }));
+  });
+
+  it("enters stale on a reset once 100·C/U exceeds four times the estimate", () => {
+    const prev = estimator({
+      prevC: 100,
+      anchorU: 15,
+      spans: [{ dC: 10, dU: 1 }],
+      ema: 1000,
+      display: 1000,
+      baseline: 1000,
+    });
+    const kept = { ema: 1000, display: 1000, baseline: 1000 };
+
+    // 100·410/10 = 4100，是估算值的 4.1 倍
+    expect(foldQuotaSample(prev, 410, 10)).toEqual(
+      estimator({ ...kept, prevC: 100, anchorU: 10, stale: { refC: 100 } }),
+    );
+    // 100·390/10 = 3900，3.9 倍：正常重置，C 照常前推
+    expect(foldQuotaSample(prev, 390, 10)).toEqual(
+      estimator({ ...kept, prevC: 390, anchorU: 10 }),
+    );
+    // 有估算值时，降幅超过 20 格也按比值判定
+    const largeDrop = foldQuotaSample({ ...prev, anchorU: 50 }, 390, 10);
+    expect(largeDrop.stale).toBeNull();
+    expect(largeDrop.prevC).toBe(390);
   });
 
   it("moves the anchor without a span when U steps with no local spend", () => {
@@ -386,6 +486,43 @@ describe("foldQuotaSample", () => {
     const next = foldQuotaSample(prev, 1005, 51);
     // recent = 100·5/1 = 500，累积 = 100·1005/51 ≈ 1970.6
     expect(next.ema).toBeCloseTo((1005 / 51) * 100, 6);
+  });
+
+  it("holds the shown value while the EMA moves within 2%", () => {
+    const prev = estimator({
+      prevC: 100,
+      anchorU: 10,
+      ema: 1000,
+      display: 1000,
+      baseline: 1000,
+    });
+    // recent 1030，EMA 走一半到 1015，只偏 1.5%
+    const held = foldQuotaSample(prev, 110.3, 11);
+    expect(held.ema).toBeCloseTo(1015, 6);
+    expect(held.display).toBe(1000);
+
+    // 再一格 $10.9/1pp：两段加权 recent ≈ 1066.8，EMA ≈ 1040.9，偏出 2%，显示值跟上
+    const moved = foldQuotaSample(held, 121.2, 12);
+    expect(moved.ema).toBeCloseTo(1040.9, 0);
+    expect(moved.display).toBe(moved.ema);
+  });
+
+  it("estimates from the spans left after trimming", () => {
+    // 加上新一格共 11pp，最旧那段 {1000, 1} 要丢。用裁剪后的段，斜率全是 $1000/pp。
+    const prev = estimator({
+      prevC: 100,
+      anchorU: 20,
+      spans: [
+        { dC: 1000, dU: 1 },
+        { dC: 90, dU: 9 },
+      ],
+    });
+    const next = foldQuotaSample(prev, 110, 21);
+    expect(next.spans).toEqual([
+      { dC: 90, dU: 9 },
+      { dC: 10, dU: 1 },
+    ]);
+    expect(next.ema).toBeCloseTo(1000, 6);
   });
 
   it("folds instants into the EMA with the previous EMA as the trend baseline", () => {
@@ -510,12 +647,19 @@ describe("foldQuotaSample", () => {
     expect(final.display).toBeCloseTo(1000, 6);
   });
 
-  it("keeps at most 64 spans", () => {
+  it("keeps the newest 64 spans", () => {
+    // 第 k 格 U 涨 0.1、花 $k，100 格合计 10pp，覆盖规则一段都不丢，只有上限起作用
     const samples: Array<[number, number]> = [[100, 10]];
-    for (let k = 1; k <= 100; k++) samples.push([100 + k, 10 + k / 10]);
+    let cost = 100;
+    for (let k = 1; k <= 100; k++) {
+      cost += k;
+      samples.push([cost, 10 + k / 10]);
+    }
     const final = lastOf(foldEach(null, samples));
     expect(final.spans).toHaveLength(64);
-    expect(lastOf(final.spans).dC).toBeCloseTo(1, 9);
+    expect(final.spans.map((span) => span.dC)).toEqual(
+      Array.from({ length: 64 }, (_, i) => 37 + i),
+    );
   });
 
   it("does not mutate the previous state", () => {
@@ -529,6 +673,27 @@ describe("foldQuotaSample", () => {
     foldQuotaSample(prev, 140, 12);
     foldQuotaSample(prev, 120, 11);
     expect(prev).toEqual(snapshot);
+  });
+});
+
+describe("seededEstimator", () => {
+  it("starts with no segment and the estimate at the seed", () => {
+    expect(seededEstimator(1234)).toEqual(
+      estimator({ ema: 1234, display: 1234, baseline: 1234 }),
+    );
+  });
+
+  it("opens a segment on the next sample and keeps the seed", () => {
+    const next = foldQuotaSample(seededEstimator(1000), 50, 10, true);
+    expect(next).toEqual(
+      estimator({
+        prevC: 50,
+        anchorU: 10,
+        ema: 1000,
+        display: 1000,
+        baseline: 1000,
+      }),
+    );
   });
 });
 
