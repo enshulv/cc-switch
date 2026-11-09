@@ -165,8 +165,8 @@ export function rowsToSeries(
   // 逐窗口回放，得到「小时 → 美元额度」。
   //
   // 断档两侧不能当作相邻样本比较：C 的口径是「本窗口内的消耗」，停机期间窗口可能滚过
-  // 一轮或几轮，而 `resetsAt` 没入库，`foldQuotaSample` 的重置判定只在使用率下降时才
-  // 触发。举例：停机前 U=25、C=$10，窗口滚了两轮，重开后 U=45、C=$90，dU=+20 不降反升，
+  // 一轮或几轮，而 `resetsAt` 没入库，`foldQuotaSample` 的重置判定只看 U 下降或 C 回落。
+  // 举例：停机前 U=25、C=$10，窗口滚了两轮，重开后 U=45、C=$90，两者都上涨，
   // 跨断档的 ΔC/ΔU 会算出错误的斜率。所以断档后开新段（`startNewSegment`），段状态
   // 清空，估算值与 stale 标记沿用：额度是账号级的美元数，与窗口无关。门槛与视觉断线一致。
   const estimateByTier = new Map<string, Map<number, number | null>>();
