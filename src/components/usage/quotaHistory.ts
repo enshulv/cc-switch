@@ -10,9 +10,9 @@
  *
  * ## 为什么存原料而不是存显示值
  *
- * 页脚显示的 `额度 $xxxx est.` 来自 [`quotaEstimate.ts`](./quotaEstimate.ts)，其状态活在一个
- * React ref 里——卸载即丢、重开重新收敛，而且只在 provider 卡片挂载时才计算。想「每小时把那个
- * 数字存下来」行不通：多数时刻它根本不存在。
+ * 页脚显示的 `额度 $xxxx est.` 来自 [`useQuotaEstimates.ts`](./useQuotaEstimates.ts)，其状态活在一个
+ * React ref 里，卸载即丢，而且只在 provider 卡片挂载时才计算。想「每小时把那个数字存下来」
+ * 行不通：多数时刻它根本不存在。页脚挂载时反过来拿这里回放出的最新值当起点（`latestTierEstimates`）。
  *
  * 所以入库的是**原料**：窗口已用百分比 U（账号级，厂商给）与本机实测消耗 C（`getModelStats`）。
  * 读取时用 quotaEstimate 里那几个纯函数在历史序列上回放，得出每个采样点的美元额度。好处是
@@ -20,7 +20,11 @@
  */
 import type { SubscriptionQuota } from "@/types/subscription";
 import type { QuotaHistoryRow, QuotaTierSample } from "@/lib/api/quotaHistory";
-import { foldQuotaSample, type EstimatorState } from "./quotaEstimate";
+import {
+  foldQuotaSample,
+  startNewSegment,
+  type EstimatorState,
+} from "./quotaEstimate";
 
 const HOUR_MS = 3_600_000;
 
@@ -101,31 +105,31 @@ export interface QuotaSeries {
 /**
  * 在一个窗口的历史序列上回放估算器，逐点得出美元额度。
  *
- * 每一步都调 `foldQuotaSample`——和页脚的实时 hook 是**同一个函数**，所以两边用的是同一套
- * 算法（增量斜率为主、累积作下界、EMA + 死区）。但**不等于两边数字时刻相同**：这个 fold 带
- * 状态且按样本推进，而页脚约 5 分钟一个样本、历史是 1 小时一个，EMA 的记忆长度因此差一个
- * 数量级（约 40 分钟 vs 约 8 小时）。额度刚变动时页脚先动、曲线后跟，是预期行为。
+ * 每一步都调 `foldQuotaSample`，和页脚的实时 hook 是同一个函数。页脚约 5 分钟折一个样本，
+ * 历史 1 小时一个，所以额度刚变动时页脚先动、曲线后跟。
  *
- * 返回值与输入样本一一对应；`null` 表示该点还没攒够窗口移动量，尚未收敛。历史回放不开
- * provisional 引导（那条路径偏低），宁可先不出数。
+ * `seed` 是起始状态，省略时从零开始。`estimates` 与输入样本一一对应，`null` 表示该点之前
+ * 还没结算出任何一段；`state` 是折完最后一个样本后的状态。历史回放不开 provisional 引导
+ * （那条路径偏低），宁可先不出数。
  */
 export function replayTierEstimates(
   samples: Array<{ u: number; c: number | null }>,
-): Array<number | null> {
-  let state: EstimatorState | null = null;
-  const out: Array<number | null> = [];
+  seed: EstimatorState | null = null,
+): { estimates: Array<number | null>; state: EstimatorState | null } {
+  let state = seed;
+  const estimates: Array<number | null> = [];
 
   for (const { u, c } of samples) {
     // 没有实测消耗（老版本落的行）就无法参与估算，但仍占一个点位。
     if (c == null || !(c > 0) || !(u > 0)) {
-      out.push(state?.display ?? null);
+      estimates.push(state?.display ?? null);
       continue;
     }
     state = foldQuotaSample(state, c, u);
-    out.push(state.display);
+    estimates.push(state.display);
   }
 
-  return out;
+  return { estimates, state };
 }
 
 /**
@@ -160,13 +164,11 @@ export function rowsToSeries(
 
   // 逐窗口回放，得到「小时 → 美元额度」。
   //
-  // 断档处必须**重置估算器**，不能把断档两侧当作相邻样本折进同一段累加：C 的口径是
-  // 「本窗口内的消耗」，窗口一重置它就归零，所以跨窗口的 ΔC 根本不在同一根轴上。
-  // 而窗口是否重置过，历史里无从判断（`resetsAt` 没入库，`dU < -RESET_DROP_PCT` 那条
-  // 启发只在使用率**下降**时才触发）。举例：5h 窗口真实额度 $200，停机前 U=25/C=$10，
-  // 停机期间窗口滚了两轮，重开后 U=45/C=$90——dU=+20 不降反升，检测不到重置，
-  // 斜率算成 100·80/20 = $400，翻倍，而且这个坏样本会被 EMA 永久吸收。
-  // 所以只要不连续就断开重来：门槛与视觉断线一致，代价只是重新预热（门槛才 2pp，很快）。
+  // 断档两侧不能当作相邻样本比较：C 的口径是「本窗口内的消耗」，停机期间窗口可能滚过
+  // 一轮或几轮，而 `resetsAt` 没入库，`foldQuotaSample` 的重置判定只在使用率下降时才
+  // 触发。举例：停机前 U=25、C=$10，窗口滚了两轮，重开后 U=45、C=$90，dU=+20 不降反升，
+  // 跨断档的 ΔC/ΔU 会算出错误的斜率。所以断档后开新段（`startNewSegment`），段状态
+  // 清空，估算值与 stale 标记沿用：额度是账号级的美元数，与窗口无关。门槛与视觉断线一致。
   const estimateByTier = new Map<string, Map<number, number | null>>();
   for (const tier of tiers) {
     const bucket = byTier.get(tier)!;
@@ -174,10 +176,12 @@ export function rowsToSeries(
     const estimates = new Map<number, number | null>();
     let segment: Array<{ u: number; c: number | null }> = [];
     let segmentHours: number[] = [];
+    let carried: EstimatorState | null = null;
 
     const flush = () => {
-      const replayed = replayTierEstimates(segment);
-      segmentHours.forEach((h, i) => estimates.set(h, replayed[i]));
+      const replayed = replayTierEstimates(segment, startNewSegment(carried));
+      segmentHours.forEach((h, i) => estimates.set(h, replayed.estimates[i]));
+      carried = replayed.state;
       segment = [];
       segmentHours = [];
     };
@@ -240,6 +244,28 @@ export function rowsToSeries(
     warmingUp: anySpend && !anyEstimate,
     estimable: anySpend,
   };
+}
+
+/**
+ * 每个窗口回放后的最后一个非 null 美元额度，键为 tier 名；页脚拿它当估算起点。
+ * 一个点都没估出来的窗口不在结果里。
+ */
+export function latestTierEstimates(
+  rows: QuotaHistoryRow[],
+  appId: string,
+): Map<string, number> {
+  const series = rowsToSeries(rows, appId);
+  const latest = new Map<string, number>();
+  for (const tier of series.tiers) {
+    for (let i = series.rows.length - 1; i >= 0; i--) {
+      const estimate = series.rows[i][tier];
+      if (estimate != null) {
+        latest.set(tier, estimate);
+        break;
+      }
+    }
+  }
+  return latest;
 }
 
 /** 按给定优先级挑出有数据的应用 */

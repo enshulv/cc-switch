@@ -119,7 +119,8 @@ export function useQuotaHistoryProbe({
   //
   // Keying on the hour bucket costs nothing real: C is cumulative WITHIN the
   // window, so sampling at :05 instead of :55 shifts spend attribution between
-  // two adjacent hours but never loses it — ΣΔC telescopes either way.
+  // two adjacent hours but never loses it: the estimator works on spend
+  // differences between samples, and those add up to the same total either way.
   const lastMeasuredHourRef = useRef<Map<string, number>>(new Map());
   useEffect(() => {
     if (!enabled) return;

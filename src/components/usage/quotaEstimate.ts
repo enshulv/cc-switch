@@ -1,42 +1,35 @@
 /**
- * Quota-estimate probe (read-only, in-memory only, no upstream logic changes).
+ * Quota-estimate algorithm (pure, no IO, no upstream logic changes).
  *
  * Providers only expose a used-percentage per subscription window
  * (`QuotaTier.utilization`), never an absolute quota. cc-switch already derives
  * the real dollar spend for each window from local session files
  * (`getModelStats(start, now, appType)`), so we can reverse-compute the
- * window's total dollar value.
+ * window's total dollar value Q ≈ 100·ΔC/ΔU.
  *
- * The subtlety: `utilization` (U) is ACCOUNT-wide — it counts every surface on
- * the account (this device, other machines, claude.ai chat, ...), while the
- * local spend (C) only covers what this install recorded. A naive cumulative
- * ratio `100·C/U` therefore underestimates whenever the account is used beyond
- * this device, and the historical baseline (e.g. a window already at 50% on a
- * fresh install) poisons it persistently.
+ * `utilization` (U) is ACCOUNT-wide — it counts every surface on the account
+ * (this device, other machines, claude.ai chat, ...) — while the local spend
+ * (C) only covers what this install recorded. U is also reported as a whole
+ * number, so most refreshes see it unchanged while C keeps rising.
  *
- * So the primary estimator is INCREMENTAL: accumulate ΔC and ΔU between
- * refreshes and take the slope `100·ΣΔC/ΣΔU`. The historical baseline cancels
- * in the deltas, so the estimate is robust to off-device usage — it converges
- * toward the true quota as you keep using THIS device. The cumulative ratio is
- * kept as a lower-bound correction (all local data is a floor the true quota
- * can't fall below); the shown value is `max(delta, cumulative)`.
+ * The estimator therefore works in SPANS: local spend accumulates while U sits
+ * still, and each time U steps up the accumulated spend is settled together
+ * with the size of the step. The estimate is a recency-weighted slope over the
+ * last few percentage points of spans (`RECENCY_HALF_LIFE_PP`), so it follows
+ * the current usage mix quickly and corrects itself as more steps arrive.
+ * Spans driven by other machines read low; they are kept as-is. The cumulative
+ * ratio `100·C/U` acts as a floor (all local data is a lower bound the true
+ * quota can't fall below).
  *
- * The live hook's state lives in a ref and is dropped on unmount (session
- * close), so it re-converges on reopen. The RAW inputs (C, U) are persisted
- * hourly by `useQuotaHistoryProbe`, and `quotaHistory.replayTierEstimates`
- * feeds them back through `foldQuotaSample` — the same single step this hook
- * uses — to draw the quota-trend chart. Sharing that step keeps the two on the
- * same algorithm; it does not make them agree instant-by-instant, because they
- * fold at different sample rates (see `foldQuotaSample`).
+ * Q is an account-level dollar figure, independent of any one window, so the
+ * estimate survives window resets and recording gaps; only the span state is
+ * cleared there (`startNewSegment`).
  *
- * Depends only on stable contracts: `QuotaTier.utilization`, `resetsAt`, and
- * `usageApi.getModelStats`. No backend or SubscriptionQuota data-flow changes.
+ * The live hook (`useQuotaEstimates`) streams refreshes through
+ * `foldQuotaSample`, and `quotaHistory.replayTierEstimates` replays the hourly
+ * persisted (C, U) series through the same step to draw the quota-trend chart.
  */
-import { useEffect, useRef, useState } from "react";
-import { useQueries, useQuery } from "@tanstack/react-query";
-import { usageApi } from "@/lib/api/usage";
 import type { ModelStats } from "@/types/usage";
-import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 86_400_000;
@@ -44,36 +37,41 @@ const DAY_MS = 86_400_000;
 /**
  * ── Tuning knobs ──────────────────────────────────────────────────────────
  * These trade responsiveness against stability. C (local spend) and U
- * (provider percentage) come from two unsynchronized sources and jitter by
- * ~1-2%. This is a single-user personal fork, so the tuning is deliberately
- * biased toward **converging fast**, accepting a jumpier first few readings.
- * Each knob can be adjusted in isolation:
+ * (provider percentage) come from two unsynchronized sources, and U moves in
+ * whole percentage points. This is a single-user personal fork, so the tuning
+ * is deliberately biased toward **converging fast**, accepting jumpier
+ * readings that later samples correct. Each knob can be adjusted in isolation:
  *
- * - MIN_OBSERVED_DU — gate (percentage points). Hold the estimate hidden until
- *   this much window movement (ΣΔU) has been observed, so the delta slope rests
- *   on some signal. At 2 the first number appears almost immediately; the cost
- *   is that it rests on little evidence, which the fast EMA below then corrects.
+ * - RECENCY_HALF_LIFE_PP — a span's weight halves for every this-many
+ *   percentage points of newer spans. At 1.5 the last 1–2 points dominate the
+ *   estimate.
+ * - SPAN_KEEP_PP / MAX_SPANS — how much span history is kept. At 10 points of
+ *   age a span weighs about 1%, so older spans cannot move the estimate
+ *   visibly.
  * - RESET_DROP_PCT — a utilization drop larger than this is treated as a window
- *   reset: the delta accumulators start a fresh segment.
+ *   reset: the spans are cleared, the estimate is kept. A smaller drop counts
+ *   as a reset only when C falls with it.
  * - EMA_ALPHA — smoothing weight of each new sample (0..1). Higher = snappier
  *   but jumpier; lower = steadier but slower. Residual error after n samples is
- *   (1−α)^n, so at α=0.45 six samples leave ~3%. The footer refreshes every
- *   5 min, so that is roughly half an hour to converge; the history chart
- *   samples hourly, so it takes ~6 hours of recorded data instead.
+ *   (1−α)^n, so at α=0.5 five samples leave ~3%. The footer refreshes every
+ *   5 min and the history chart samples hourly, so the footer converges in
+ *   minutes and the chart in hours.
  * - DISPLAY_DEADBAND_RATIO — hysteresis on the shown number. Hold the last
  *   figure until the EMA drifts past this fraction, then snap to it.
  * - TREND_EPS_RATIO — dead zone for the trend arrow. Moves within this fraction
  *   of the baseline read as "flat" instead of up/down.
  * - PROVISIONAL_MIN_TOKENS — bootstrap gate, measured on the 7-day window using
  *   cache-inclusive tokens (realTotalTokens; input + output + cache read +
- *   cache creation). Before the delta method has warmed up, if that window
- *   already holds enough local token history, show the direct (cumulative)
- *   inference immediately — marked provisional — instead of hiding. The one
- *   decision is shared across all tiers so 5h and 7d light up together.
+ *   cache creation). Before the first span settles, if that window already
+ *   holds enough local token history, show the direct (cumulative) inference
+ *   immediately instead of hiding. The one decision is shared across all tiers
+ *   so 5h and 7d light up together.
  */
-export const MIN_OBSERVED_DU = 2;
+export const RECENCY_HALF_LIFE_PP = 1.5;
+const SPAN_KEEP_PP = 10;
+const MAX_SPANS = 64;
 export const RESET_DROP_PCT = 20;
-const EMA_ALPHA = 0.45;
+const EMA_ALPHA = 0.5;
 const DISPLAY_DEADBAND_RATIO = 0.02;
 const TREND_EPS_RATIO = 0.08;
 export const PROVISIONAL_MIN_TOKENS = 500_000_000;
@@ -137,23 +135,24 @@ export function sumTierCost(rows: ModelStats[], tierName: string): number {
 
 /**
  * Window start as Unix **seconds** (`resetsAt − window length`), or null when
- * the tier has no known window or no reset time.
+ * the tier has no known window, no reset time, or a reset time at or before
+ * `nowMs`. A past `resetsAt` belongs to a window that has already rolled over,
+ * so the current window's start is unknown.
  *
  * `get_model_stats` takes seconds (see `resolveUsageRange`); passing millis
  * pushes the range into the future and returns no spend, so the numerator
  * silently becomes 0. Shared by the live hook and the hourly history probe so
  * both measure the exact same interval.
  */
-export function tierWindowStartSec(tier: {
-  name: string;
-  resetsAt: string | null;
-}): number | null {
+export function tierWindowStartSec(
+  tier: { name: string; resetsAt: string | null },
+  nowMs: number = Date.now(),
+): number | null {
   const windowMs = tierWindowMs(tier.name);
   if (windowMs == null || !tier.resetsAt) return null;
-  const start = Math.floor(
-    (new Date(tier.resetsAt).getTime() - windowMs) / 1000,
-  );
-  return Number.isFinite(start) ? start : null;
+  const resetsMs = new Date(tier.resetsAt).getTime();
+  if (!Number.isFinite(resetsMs) || resetsMs <= nowMs) return null;
+  return Math.floor((resetsMs - windowMs) / 1000);
 }
 
 /**
@@ -169,34 +168,6 @@ export function cumulativeQuotaUsd(
     return null;
   }
   return (costUsd / utilization) * 100;
-}
-
-/**
- * Incremental (baseline-robust) estimate: 100 · ΣΔC ÷ ΣΔU, available only once
- * at least `minObservedDU` of window movement has been accumulated. Because it
- * works on deltas, any historical / off-device baseline cancels out.
- */
-export function deltaSlopeQuotaUsd(
-  sumDC: number,
-  sumDU: number,
-  minObservedDU: number = MIN_OBSERVED_DU,
-): number | null {
-  if (!(sumDU >= minObservedDU) || !(sumDU > 0) || sumDC <= 0) return null;
-  return (sumDC / sumDU) * 100;
-}
-
-/**
- * Combine the two estimators: the baseline-robust delta is the primary value,
- * corrected upward by the cumulative lower bound from all local data. Returns
- * null (hidden) until the delta estimate has passed its gate.
- */
-export function combineEstimates(
-  deltaEst: number | null,
-  cumulativeEst: number | null,
-): number | null {
-  if (deltaEst == null) return null;
-  if (cumulativeEst == null) return deltaEst;
-  return Math.max(deltaEst, cumulativeEst);
 }
 
 /** Exponential moving average: fold a new sample into the running estimate. */
@@ -228,26 +199,30 @@ export function classifyTrend(
   return diff > 0 ? "up" : "down";
 }
 
-export interface TierEstimate {
-  tierName: string;
-  /** Deadbanded, EMA-smoothed quota ($) for display; null until shown. */
-  quotaUsd: number | null;
-  /** Window movement (ΣΔU, percentage points) observed this session so far. */
-  observedDeltaUtil: number;
-  utilization: number;
-  trend: "up" | "down" | "flat" | null;
-  loading: boolean;
+/** Local spend settled against one step of utilization. */
+export interface QuotaSpan {
+  /** Local spend since the previous step, dollars. */
+  dC: number;
+  /** Size of the step, percentage points. */
+  dU: number;
 }
 
 /** Everything the estimator carries from one observation to the next. */
 export interface EstimatorState {
-  /** Last observed local window spend and account utilization (for deltas). */
-  prevC: number;
-  prevU: number;
-  /** Accumulated positive deltas (a fresh segment resets these). */
-  sumDC: number;
-  sumDU: number;
-  /** Smoothed combined estimate; null until the gate is met. */
+  /** Previous sample's C; null at the start of a segment. */
+  prevC: number | null;
+  /** Highest U seen in this segment; null at the start of a segment. */
+  anchorU: number | null;
+  /** Local spend since the last step of U, not yet settled into a span. */
+  pendingDC: number;
+  /** Settled spans, oldest first. */
+  spans: QuotaSpan[];
+  /**
+   * Non-null while C still carries the previous window's spend after a reset;
+   * `refC` is the last trusted C before the reset.
+   */
+  stale: { refC: number } | null;
+  /** Smoothed estimate; null until the first instant estimate. */
   ema: number | null;
   /** Deadbanded value actually shown. */
   display: number | null;
@@ -255,29 +230,95 @@ export interface EstimatorState {
   baseline: number | null;
 }
 
-interface TierAccum extends EstimatorState {
-  /** The quota.queriedAt already folded, to avoid folding the same snapshot twice. */
-  lastQueriedAt: number;
+/**
+ * Copy of `prev` with the segment cleared and the estimate and stale marker
+ * kept, for samples that cannot be compared with the previous one (a recording
+ * gap). Null stays null.
+ */
+export function startNewSegment(
+  prev: EstimatorState | null,
+): EstimatorState | null {
+  if (prev == null) return null;
+  // Rows recorded while the probe still measured C against an expired
+  // `resetsAt` carry the old window's spend for days, across gaps; dropping
+  // the marker there turns those rows into C/U spikes. New rows cannot enter
+  // that state: `tierWindowStartSec` returns null for an expired window, so no
+  // spend is recorded.
+  return { ...prev, prevC: null, anchorU: null, pendingDC: 0, spans: [] };
+}
+
+/** 100 · Σ(w·dC) ÷ Σ(w·dU), each span weighted by the points of newer spans. */
+function recencyWeightedQuotaUsd(spans: readonly QuotaSpan[]): number {
+  let weightedDC = 0;
+  let weightedDU = 0;
+  let age = 0;
+  for (let i = spans.length - 1; i >= 0; i--) {
+    const weight = 0.5 ** (age / RECENCY_HALF_LIFE_PP);
+    weightedDC += weight * spans[i].dC;
+    weightedDU += weight * spans[i].dU;
+    age += spans[i].dU;
+  }
+  return (100 * weightedDC) / weightedDU;
+}
+
+/** Drop the oldest spans while the rest still cover SPAN_KEEP_PP; cap at MAX_SPANS. */
+function trimSpans(spans: QuotaSpan[]): QuotaSpan[] {
+  let total = spans.reduce((acc, s) => acc + s.dU, 0);
+  let first = 0;
+  while (
+    first < spans.length &&
+    (spans.length - first > MAX_SPANS ||
+      total - spans[first].dU >= SPAN_KEEP_PP)
+  ) {
+    total -= spans[first].dU;
+    first++;
+  }
+  return first === 0 ? spans : spans.slice(first);
+}
+
+/** The estimate-related fields of the state. */
+type EstimateFields = Pick<EstimatorState, "ema" | "display" | "baseline">;
+
+function foldInstant(
+  prev: EstimateFields,
+  instant: number | null,
+): EstimateFields {
+  if (instant == null) return prev;
+  const ema = foldEma(prev.ema, instant);
+  return {
+    baseline: prev.ema ?? instant,
+    ema,
+    display: applyDeadband(prev.display, ema),
+  };
+}
+
+function instantEstimate(
+  spans: readonly QuotaSpan[],
+  costUsd: number,
+  utilization: number,
+  provisionalOK: boolean,
+): number | null {
+  const cumulative = cumulativeQuotaUsd(costUsd, utilization);
+  if (spans.length > 0) {
+    const recent = recencyWeightedQuotaUsd(spans);
+    return cumulative == null ? recent : Math.max(recent, cumulative);
+  }
+  return provisionalOK ? cumulative : null;
 }
 
 /**
  * Fold one (spend, utilization) observation into the estimator — the single
- * step of the whole algorithm, kept pure so it has exactly one implementation.
+ * step of the whole algorithm, shared by the live footer and the history
+ * replay. Returns a new state; `prev` is not modified.
  *
- * Two callers drive it: `useQuotaEstimates` streams live refreshes through it,
- * and `quotaHistory.replayTierEstimates` replays a persisted hourly series
- * through it. Sharing this guarantees both use the same ALGORITHM — it does NOT
- * make them show the same number at the same moment, and they are not expected
- * to: the fold is stateful and per-sample, and the two drivers sample at very
- * different rates (footer ~5 min, history 1 h). The EMA therefore has ~40 min of
- * memory in the footer and ~8 h in the chart, so right after a quota change the
- * footer moves first and the chart lags. Treat the chart as an hourly-resolution
- * view of the same estimator, not as a mirror of the footer.
+ * The footer folds every ~5 min and the history chart hourly, so the two show
+ * the same algorithm at different sample rates, not the same number at the
+ * same moment.
  *
- * `allowProvisional` opens the bootstrap path: before the delta estimator has
- * warmed up, accept the (low-biased) cumulative inference. The live hook gates
- * it on having enough local token history; the historical replay leaves it off
- * and simply shows nothing until the delta estimate converges.
+ * `allowProvisional` lets the (low-biased) cumulative inference stand in until
+ * the first span settles, provided the state carries no estimate yet. The live
+ * hook gates it on having enough local token history; the history replay
+ * leaves it off.
  */
 export function foldQuotaSample(
   prev: EstimatorState | null,
@@ -285,175 +326,77 @@ export function foldQuotaSample(
   utilization: number,
   allowProvisional = false,
 ): EstimatorState {
-  let sumDC = prev?.sumDC ?? 0;
-  let sumDU = prev?.sumDU ?? 0;
-  if (prev) {
-    const dU = utilization - prev.prevU;
+  if (prev?.stale != null) {
+    // C still counts the previous window until it falls below the last trusted
+    // value; only then do (C, U) describe the same window again.
+    if (costUsd >= prev.stale.refC) return prev;
+    return {
+      ...prev,
+      prevC: costUsd,
+      anchorU: utilization,
+      pendingDC: 0,
+      spans: [],
+      stale: null,
+    };
+  }
+
+  const estimate: EstimateFields = {
+    ema: prev?.ema ?? null,
+    display: prev?.display ?? null,
+    baseline: prev?.baseline ?? null,
+  };
+  let anchorU = utilization;
+  let pendingDC = prev?.pendingDC ?? 0;
+  let spans = prev?.spans ?? [];
+
+  if (prev?.prevC != null && prev.anchorU != null) {
+    const dU = utilization - prev.anchorU;
     const dC = costUsd - prev.prevC;
-    if (dU < -RESET_DROP_PCT) {
-      // Window reset: start a fresh accumulation segment.
-      sumDC = 0;
-      sumDU = 0;
-    } else if (dU > 0 && dC > 0) {
-      // Progress driven by local activity — the only intervals we trust.
-      // (dU>0 but dC<=0 means off-device-only usage; skip so it can't pollute.)
-      sumDC += dC;
-      sumDU += dU;
+    // C only grows within a window, so U falling together with C can only be
+    // a reset, however small the drop; 5h windows often reset below 20%.
+    const largeDrop = dU < -RESET_DROP_PCT;
+    if (largeDrop || (dU < 0 && dC < 0)) {
+      spans = [];
+      pendingDC = 0;
+      if (largeDrop && dC >= 0) {
+        // The window reset but C did not fall with it: its window start is
+        // still the old one, so C/U would be wildly inflated.
+        return {
+          ...estimate,
+          prevC: prev.prevC,
+          anchorU,
+          pendingDC,
+          spans,
+          stale: { refC: prev.prevC },
+        };
+      }
+    } else if (dU <= 0) {
+      // U has not stepped; small drops with C still rising are jitter and must
+      // not lower the anchor, or 52 → 51 → 52 would count as a step.
+      pendingDC += Math.max(dC, 0);
+      anchorU = prev.anchorU;
+    } else {
+      const settled = pendingDC + Math.max(dC, 0);
+      pendingDC = 0;
+      // A step with no local spend is other machines' usage: move the anchor
+      // past it without a span.
+      if (settled > 0) spans = [...spans, { dC: settled, dU }];
     }
   }
 
-  // Usage inference (delta, baseline-robust) is primary; before it warms up,
-  // bootstrap from the cold inference (cumulative) when allowed.
-  const deltaEst = deltaSlopeQuotaUsd(sumDC, sumDU);
-  const cumEst = cumulativeQuotaUsd(costUsd, utilization);
-  let instant: number | null = null;
-  if (deltaEst != null) {
-    instant = combineEstimates(deltaEst, cumEst);
-  } else if (allowProvisional && cumEst != null) {
-    instant = cumEst;
-  }
-
-  let ema = prev?.ema ?? null;
-  let display = prev?.display ?? null;
-  let baseline = prev?.baseline ?? null;
-  if (instant != null) {
-    baseline = ema ?? instant;
-    ema = foldEma(ema, instant);
-    display = applyDeadband(display, ema);
-  }
+  const instant = instantEstimate(
+    spans,
+    costUsd,
+    utilization,
+    allowProvisional && estimate.ema == null,
+  );
 
   return {
+    ...foldInstant(estimate, instant),
     prevC: costUsd,
-    prevU: utilization,
-    sumDC,
-    sumDU,
-    ema,
-    display,
-    baseline,
+    anchorU,
+    pendingDC,
+    spans: trimSpans(spans),
+    stale: null,
   };
-}
-
-/**
- * Compute a quota estimate for every estimable tier of a SubscriptionQuota.
- *
- * Returns `Map<tierName, TierEstimate>`. Pure derived state plus one ref that
- * accumulates deltas and converges across refreshes; it is dropped on unmount
- * (re-converges on reopen — nothing is persisted).
- */
-export function useQuotaEstimates(
-  appId: string | undefined,
-  quota: SubscriptionQuota | undefined,
-): Map<string, TierEstimate> {
-  const enabled = isEstimableApp(appId) && Boolean(quota?.success);
-  const queriedAt = quota?.queriedAt ?? 0;
-
-  const tiers: QuotaTier[] = enabled ? (quota?.tiers ?? []) : [];
-  const estimableTiers = tiers.filter(
-    (t) => tierWindowMs(t.name) != null && Boolean(t.resetsAt),
-  );
-
-  const results = useQueries({
-    queries: estimableTiers.map((t) => {
-      const start = tierWindowStartSec(t)!;
-      const end = Math.floor(Date.now() / 1000);
-      return {
-        // queriedAt in the key: only recompute when the quota is re-fetched,
-        // avoiding render churn. start in the key: bust the cache when the
-        // window start changes so a stale result is not reused.
-        queryKey: ["quotaEstimate", appId, t.name, queriedAt, start] as const,
-        queryFn: () =>
-          usageApi.getModelStats(start, end, appId as EstimableApp),
-        enabled,
-        staleTime: 5 * 60 * 1000,
-      };
-    }),
-  });
-
-  // Provisional bootstrap gate: anchored on the 7-day window, using
-  // cache-inclusive tokens (realTotalTokens) — get_model_stats.total_tokens
-  // excludes cache reads/creation, which understates a heavy account by ~100x.
-  const sevenDayTier = estimableTiers.find(
-    (t) => tierWindowMs(t.name) === 7 * DAY_MS,
-  );
-  const sevenDayStart =
-    sevenDayTier?.resetsAt != null
-      ? Math.floor(
-          (new Date(sevenDayTier.resetsAt).getTime() - 7 * DAY_MS) / 1000,
-        )
-      : null;
-  const sevenDaySummary = useQuery({
-    queryKey: ["quotaEstimateTokens", appId, queriedAt, sevenDayStart],
-    queryFn: () =>
-      usageApi.getUsageSummary(
-        sevenDayStart as number,
-        Math.floor(Date.now() / 1000),
-        appId as EstimableApp,
-      ),
-    enabled: enabled && sevenDayStart != null,
-    staleTime: 5 * 60 * 1000,
-  });
-  const provisionalOK =
-    (sevenDaySummary.data?.realTotalTokens ?? 0) >= PROVISIONAL_MIN_TOKENS;
-
-  const accumRef = useRef<Map<string, TierAccum>>(new Map());
-  const [, bump] = useState(0);
-
-  // Fold each new snapshot into the delta accumulators once it lands.
-  const settleSignature = results
-    .map((r) => r.dataUpdatedAt)
-    .concat(sevenDaySummary.dataUpdatedAt)
-    .join(",");
-  useEffect(() => {
-    if (!enabled) return;
-
-    // Pre-pass: current spend/utilization per tier. `provisionalOK` (the shared
-    // 7-day bootstrap gate, computed above) is applied to every tier so 5h and
-    // 7d appear together rather than one at a time.
-    const snaps = estimableTiers.map((t, i) => {
-      const rows = results[i]?.data;
-      if (!rows) return null;
-      return {
-        t,
-        C: sumTierCost(rows, t.name),
-        U: t.utilization,
-      };
-    });
-
-    let changed = false;
-    snaps.forEach((s) => {
-      if (!s) return;
-      const { t, C, U } = s;
-      if (!(C > 0) || !(U > 0)) return; // nothing measurable yet
-
-      const key = `${appId}:${t.name}`;
-      const rec = accumRef.current.get(key);
-      if (rec && rec.lastQueriedAt === queriedAt) return; // already folded
-
-      // One shared step, also used by the historical replay in quotaHistory.ts
-      // — so the footer and the quota-trend chart can never disagree.
-      accumRef.current.set(key, {
-        ...foldQuotaSample(rec ?? null, C, U, provisionalOK),
-        lastQueriedAt: queriedAt,
-      });
-      changed = true;
-    });
-    if (changed) bump((v) => v + 1);
-    // settleSignature covers result-data changes; queriedAt covers snapshot rotation.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, appId, queriedAt, settleSignature]);
-
-  const estimates = new Map<string, TierEstimate>();
-  estimableTiers.forEach((t, i) => {
-    const rec = accumRef.current.get(`${appId}:${t.name}`);
-    estimates.set(t.name, {
-      tierName: t.name,
-      quotaUsd: rec?.display ?? null,
-      observedDeltaUtil: rec?.sumDU ?? 0,
-      utilization: t.utilization,
-      trend: rec?.ema != null ? classifyTrend(rec.baseline, rec.ema) : null,
-      loading: results[i]?.isLoading ?? false,
-    });
-  });
-
-  return estimates;
 }
