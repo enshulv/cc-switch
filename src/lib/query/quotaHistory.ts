@@ -12,12 +12,17 @@ export const quotaHistoryKeys = {
  *
  * key 用**小时序号**而不是秒级时间戳：面板的范围终点是「现在」，秒级的话每次
  * 渲染都会换 key、无限重查。按小时量化后一小时内 key 稳定，正好也是探针的写入
- * 节奏。数据由探针写入后主动 invalidate，所以不需要轮询。
+ * 节奏。数据由探针写入后主动 invalidate，所以不需要轮询。`enabled` 为 false 时不查询。
  */
-export function useQuotaHistory(startHour: number, endHour: number) {
+export function useQuotaHistory(
+  startHour: number,
+  endHour: number,
+  enabled = true,
+) {
   return useQuery({
     queryKey: quotaHistoryKeys.range(startHour, endHour),
     queryFn: () => quotaHistoryApi.query(null, startHour, endHour),
     staleTime: 60 * 60 * 1000,
+    enabled,
   });
 }

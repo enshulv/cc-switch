@@ -5,6 +5,7 @@ import {
   appsWithHistory,
   hourIndex,
   hourStartMs,
+  latestTierEstimates,
   replayTierEstimates,
   rowsToSeries,
   toQuotaSamples,
@@ -55,7 +56,7 @@ function row(
 
 /**
  * 一条会收敛的序列：额度恰好 $1000（U 每步 +10，C 每步 +$100）。
- * MIN_OBSERVED_DU=5，所以第 2 个点就够门槛，斜率 100·ΔC/ΔU = 1000。
+ * 第 2 个点结算出第一段，斜率 100·ΔC/ΔU = 1000。
  */
 function convergingRows(tier = "five_hour"): QuotaHistoryRow[] {
   return [10, 20, 30].map((u, i) =>
@@ -159,27 +160,27 @@ describe("toQuotaSamples", () => {
 describe("replayTierEstimates", () => {
   it("converges to the true quota once enough window movement is seen", () => {
     // 额度 $1000：U 10→20→30，C $100→$200→$300
-    const out = replayTierEstimates([
+    const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
       { u: 30, c: 300 },
     ]);
-    expect(out[0]).toBeNull(); // 首点没有增量，未达门槛
+    expect(out[0]).toBeNull(); // 首点只开段，还没有结算出任何段
     expect(out[1]).toBeCloseTo(1000, 6);
     expect(out[2]).toBeCloseTo(1000, 6);
   });
 
-  it("stays null while window movement is below the gate", () => {
-    // ΣΔU = 1 < MIN_OBSERVED_DU
-    const out = replayTierEstimates([
+  it("estimates from the first settled one-point step", () => {
+    const { estimates } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 11, c: 110 },
     ]);
-    expect(out).toEqual([null, null]);
+    expect(estimates[0]).toBeNull();
+    expect(estimates[1]).toBeCloseTo(1000, 6);
   });
 
   it("holds the last value across rows that carry no measured spend", () => {
-    const out = replayTierEstimates([
+    const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
       { u: 25, c: null },
@@ -191,7 +192,7 @@ describe("replayTierEstimates", () => {
     // 前三点确立 $1000。随后 U 从 30 骤降到 2（窗口重置），新段的真实额度是 $2000
     // （U 每 +10 对应 C 每 +$200）。若删掉重置清零那一支，累加器会把跨重置的
     // ΔC/ΔU 混进老段，斜率被拉向 $1000 附近——本用例即以此判定重置是否真的生效。
-    const out = replayTierEstimates([
+    const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
       { u: 30, c: 300 },
@@ -209,12 +210,76 @@ describe("replayTierEstimates", () => {
   it("ignores intervals where the window moved without local spend", () => {
     // 账号在别的设备上烧掉了 20 个百分点（ΔU>0 但 ΔC=0）——这正是增量法存在的理由。
     // 若把 `dU > 0 && dC > 0` 放宽成 `dU > 0`，这段会进入分母，斜率从 $1000 掉到 $400。
-    const out = replayTierEstimates([
+    const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 30, c: 100 },
       { u: 40, c: 200 },
     ]);
     expect(out[2]).toBeCloseTo(1000, 6);
+  });
+
+  it("returns the state after the last sample", () => {
+    const { estimates, state } = replayTierEstimates([
+      { u: 10, c: 100 },
+      { u: 20, c: 200 },
+      { u: 25, c: null },
+    ]);
+    expect(state).not.toBeNull();
+    expect(state!.display).toBe(estimates[1]);
+    expect(state!.prevC).toBe(200);
+    expect(state!.anchorU).toBe(20);
+  });
+
+  it("starts from the seed state when one is given", () => {
+    const { state: seed } = replayTierEstimates([
+      { u: 10, c: 100 },
+      { u: 20, c: 200 },
+    ]);
+    const { estimates } = replayTierEstimates(
+      [
+        { u: 30, c: null },
+        { u: 30, c: 300 },
+      ],
+      seed,
+    );
+    // 无花费的占位点输出种子的 display；下一点接着种子的段往下折，结算出 $1000
+    expect(estimates[0]).toBeCloseTo(1000, 6);
+    expect(estimates[1]).toBeCloseTo(1000, 6);
+  });
+
+  it("keeps a small-drop window reset from inflating the estimate", () => {
+    // 真实形状：U 12→1 时 C 166.9→8.0。当抖动处理的话最后一点算出约 $2282。
+    const { estimates } = replayTierEstimates([
+      { u: 12, c: 166.9 },
+      { u: 1, c: 8.0 },
+      { u: 1, c: 11.4 },
+      { u: 2, c: 13.3 },
+      { u: 10, c: 89.2 },
+      { u: 20, c: 190.6 },
+    ]);
+    for (const value of estimates.slice(3)) {
+      expect(value).not.toBeNull();
+      expect(value!).toBeLessThan(1100);
+    }
+  });
+
+  it("keeps the estimate steady while C still carries the previous window's spend", () => {
+    // 真实形状：U 53→0→0→2→3，C 1996→2031→2051→2086→2192，之后 C 跌到 5。
+    // U=0 的点不参与回放；U=2 那点检测到重置，C 没回落，进入 stale。
+    const { estimates } = replayTierEstimates([
+      { u: 52, c: 1956 },
+      { u: 53, c: 1996 }, // 结算 $40/1pp，得 $4000
+      { u: 0, c: 2031 },
+      { u: 0, c: 2051 },
+      { u: 2, c: 2086 },
+      { u: 3, c: 2192 },
+      { u: 4, c: 5 },
+      { u: 5, c: 45 },
+    ]);
+    expect(estimates[1]).toBeCloseTo(4000, 6);
+    for (const value of estimates.slice(2)) {
+      expect(value).toBeCloseTo(4000, 6);
+    }
   });
 });
 
@@ -310,19 +375,53 @@ describe("rowsToSeries", () => {
     expect(rows[1].five_hour).toBeCloseTo(1000, 6);
   });
 
-  it("restarts the estimator across a gap instead of folding through it", () => {
-    // 停机期间 5h 窗口滚过若干轮，C 已归零重算——跨断档的 ΔC 不在同一根轴上。
-    // 若断档处不重置，dU=+20/dC=+80 会算出 $400（真实是 $200 那一档），并被 EMA 吸收。
+  it("carries the estimate across a gap without folding the gap's deltas", () => {
+    // 断档前确立 $1000。停机期间窗口滚过，重开后 U=5、C=$10。
+    // 断档后第一点只开新段，显示沿用 $1000；下一点结算 $300/10pp，即 $3000，
+    // EMA 从 $1000 走一半到 $2000。
+    // 从零重来的话，断档后第一点是 null、第二点是 $3000；
+    // 跨断档硬折的话，dU 一直 ≤ 0，第二点不结算，停在 $1000。
     const { rows } = rowsToSeries(
       [
-        row(10, "five_hour", 5, { spendUsd: 10 }),
-        row(11, "five_hour", 25, { spendUsd: 10 }),
-        row(30, "five_hour", 45, { spendUsd: 90 }),
+        row(10, "five_hour", 10, { spendUsd: 100 }),
+        row(11, "five_hour", 20, { spendUsd: 200 }),
+        row(30, "five_hour", 5, { spendUsd: 10 }),
+        row(31, "five_hour", 15, { spendUsd: 310 }),
       ],
       "claude",
     );
-    const afterGap = rows[rows.length - 1];
-    expect(afterGap.five_hour).toBeNull();
+    expect(rows.map((r) => r.ts)).toEqual([
+      hourStartMs(10),
+      hourStartMs(11),
+      hourStartMs(12),
+      hourStartMs(30),
+      hourStartMs(31),
+    ]);
+    expect(rows[1].five_hour).toBeCloseTo(1000, 6);
+    expect(rows[2].five_hour).toBeNull(); // 断线行
+    expect(rows[3].five_hour).toBeCloseTo(1000, 6);
+    expect(rows[4].five_hour).toBeCloseTo(2000, 6);
+  });
+
+  it("keeps ignoring stale spend across a gap", () => {
+    // 真实形状：重置后 U 只有 2..5，C 却残留旧窗口的累计（约 $920..$1100），
+    // 而且跨过了断档。断档后若不再忽略这些样本，C/U 会冲到上万。
+    const { rows } = rowsToSeries(
+      [
+        row(10, "seven_day", 80, { spendUsd: 800 }),
+        row(11, "seven_day", 81, { spendUsd: 820 }), // 结算 $20/1pp，得 $2000
+        row(12, "seven_day", 2, { spendUsd: 920 }), // 重置，C 没回落：进入 stale
+        row(13, "seven_day", 3, { spendUsd: 960 }),
+        row(16, "seven_day", 4, { spendUsd: 1050 }),
+        row(17, "seven_day", 5, { spendUsd: 1100 }),
+      ],
+      "claude",
+    );
+    // rows = [h10, h11, h12, h13, 断档行, h16, h17]
+    expect(rows[4].seven_day).toBeNull();
+    for (const index of [1, 2, 3, 5, 6]) {
+      expect(rows[index].seven_day).toBeCloseTo(2000, 6);
+    }
   });
 
   it("fills gap rows with explicit nulls for every tier", () => {
@@ -351,6 +450,68 @@ describe("rowsToSeries", () => {
     );
     expect(estimable).toBe(false);
     expect(warmingUp).toBe(false);
+  });
+});
+
+describe("latestTierEstimates", () => {
+  it("takes each window's last non-null estimate for the requested app", () => {
+    const rows = [
+      row(10, "five_hour", 10, { spendUsd: 100 }),
+      row(11, "five_hour", 20, { spendUsd: 200 }),
+      row(12, "five_hour", 21, { spendUsd: 230 }), // $30/1pp，拉高 EMA
+      row(10, "seven_day", 5, { spendUsd: 50 }),
+      row(11, "seven_day", 6, { spendUsd: 70 }),
+      row(10, "premium", 10, { appId: "codex", spendUsd: 100 }),
+      row(11, "premium", 20, { appId: "codex", spendUsd: 500 }),
+    ];
+    const lastFiveHour = rowsToSeries(rows, "claude").rows.at(-1)!.five_hour;
+    expect(lastFiveHour).not.toBeNull();
+    expect(lastFiveHour).not.toBeCloseTo(1000, 0);
+
+    const seeds = latestTierEstimates(rows, "claude");
+    expect([...seeds.keys()].sort()).toEqual(["five_hour", "seven_day"]);
+    expect(seeds.get("five_hour")).toBeCloseTo(lastFiveHour!, 6);
+    expect(seeds.get("seven_day")).toBeCloseTo(2000, 6);
+  });
+
+  it("looks past hours where the window has no sample", () => {
+    // seven_day 在最后一小时缺席，序列末尾是显式 null
+    const rows = [
+      row(10, "seven_day", 5, { spendUsd: 50 }),
+      row(11, "seven_day", 6, { spendUsd: 70 }),
+      row(12, "five_hour", 10, { spendUsd: 100 }),
+    ];
+    const seeds = latestTierEstimates(rows, "claude");
+    expect(seeds.get("seven_day")).toBeCloseTo(2000, 6);
+    expect(seeds.has("five_hour")).toBe(false);
+  });
+
+  it("looks past the null row inserted at a gap", () => {
+    const rows = [
+      row(10, "five_hour", 10, { spendUsd: 100 }),
+      row(11, "five_hour", 20, { spendUsd: 200 }),
+      row(30, "seven_day", 5, { spendUsd: 50 }),
+    ];
+    expect(latestTierEstimates(rows, "claude").get("five_hour")).toBeCloseTo(
+      1000,
+      6,
+    );
+  });
+
+  it("returns no seeds when nothing has been estimated", () => {
+    expect(latestTierEstimates([], "claude").size).toBe(0);
+    expect(
+      latestTierEstimates(
+        [row(10, "five_hour", 10, { spendUsd: 100 })],
+        "claude",
+      ).size,
+    ).toBe(0);
+    expect(
+      latestTierEstimates(
+        [row(10, "five_hour", 10, { appId: "codex", spendUsd: 100 })],
+        "claude",
+      ).size,
+    ).toBe(0);
   });
 });
 
