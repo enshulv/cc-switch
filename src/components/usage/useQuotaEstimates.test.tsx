@@ -63,7 +63,7 @@ function tier(
   };
 }
 
-function quota(tiers: QuotaTier[]): SubscriptionQuota {
+function quota(tiers: QuotaTier[], queriedAt = QUERIED_AT): SubscriptionQuota {
   return {
     tool: "claude",
     credentialStatus: "valid",
@@ -72,7 +72,7 @@ function quota(tiers: QuotaTier[]): SubscriptionQuota {
     tiers,
     extraUsage: null,
     error: null,
-    queriedAt: QUERIED_AT,
+    queriedAt,
   };
 }
 
@@ -105,6 +105,16 @@ const historySeeding2000 = [
   historyRow(2, "five_hour", 11, 120),
 ];
 
+/** 回放后 five_hour 是 $1000，seven_day 是 $3000（1pp 花 $30） */
+const historySeedingBothWindows = [
+  ...historySeeding1000,
+  historyRow(3, "seven_day", 10, 100),
+  historyRow(2, "seven_day", 11, 130),
+];
+
+/** 下一份快照与首份相隔 5 分钟 */
+const NEXT_QUERIED_AT = QUERIED_AT + 300_000;
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((r) => {
@@ -117,11 +127,17 @@ function deferred<T>() {
  * 5h 与 7d 两个窗口都在有效期内。provisional 的门槛挂在 7d 窗口上，
  * 少了 7d 窗口就永远不走 provisional。
  */
-function liveQuota(): SubscriptionQuota {
-  return quota([
-    tier("five_hour", 10, 2 * HOUR_MS),
-    tier("seven_day", 10, 72 * HOUR_MS),
-  ]);
+function liveQuota(
+  utilization = 10,
+  queriedAt = QUERIED_AT,
+): SubscriptionQuota {
+  return quota(
+    [
+      tier("five_hour", utilization, 2 * HOUR_MS),
+      tier("seven_day", utilization, 72 * HOUR_MS),
+    ],
+    queriedAt,
+  );
 }
 
 let client: QueryClient;
@@ -130,7 +146,11 @@ function renderEstimates(appId: string, q: SubscriptionQuota) {
   const wrapper = ({ children }: PropsWithChildren) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
-  return renderHook(() => useQuotaEstimates(appId, q), { wrapper });
+  return renderHook(
+    ({ current }: { current: SubscriptionQuota }) =>
+      useQuotaEstimates(appId, current),
+    { wrapper, initialProps: { current: q } },
+  );
 }
 
 /** 让已排队的 promise 与 effect 都跑完 */
@@ -167,12 +187,16 @@ describe("useQuotaEstimates", () => {
 
   it("queries the last 14 days of history for every app", async () => {
     queryHistory.mockResolvedValue([]);
+    const hourBefore = Math.floor(Date.now() / HOUR_MS);
     renderEstimates("claude", liveQuota());
     await waitFor(() => expect(queryHistory).toHaveBeenCalled());
+    const hourAfter = Math.floor(Date.now() / HOUR_MS);
     const [appId, startHour, endHour] = queryHistory.mock.calls[0];
     expect(appId).toBeNull();
     expect(endHour - startHour).toBe(14 * 24);
-    expect(endHour).toBe(Math.floor(Date.now() / HOUR_MS));
+    // 跨整点时 render 期间的小时序号可能落在前后任一边
+    expect(endHour).toBeGreaterThanOrEqual(hourBefore);
+    expect(endHour).toBeLessThanOrEqual(hourAfter);
   });
 
   it("falls back to the provisional estimate when history is empty", async () => {
@@ -212,18 +236,58 @@ describe("useQuotaEstimates", () => {
 
   it("uses the seed only when the record is created", async () => {
     queryHistory.mockResolvedValue(historySeeding1000);
-    const { result } = renderEstimates("claude", liveQuota());
+    const { result, rerender } = renderEstimates("claude", liveQuota());
     await waitFor(() =>
       expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1000, 6),
     );
 
+    // 换一份种子是 $2000 的历史并让它重查
     queryHistory.mockResolvedValue(historySeeding2000);
     await act(async () => {
       await client.invalidateQueries({ queryKey: quotaHistoryKeys.all });
     });
     await waitFor(() => expect(queryHistory).toHaveBeenCalledTimes(2));
+
+    // 下一份快照：C $50→$70、U 10→11。从记录往前折结算 {20, 1}，即 $2000，
+    // EMA 从 $1000 走一半到 $1500。重新播种的话，这一样本只开段，停在种子 $1000 或 $2000。
+    getModelStats.mockResolvedValue(modelStats(70));
+    rerender({ current: liveQuota(11, NEXT_QUERIED_AT) });
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1500, 6),
+    );
+  });
+
+  it("seeds each window from its own history", async () => {
+    queryHistory.mockResolvedValue(historySeedingBothWindows);
+    const { result } = renderEstimates("claude", liveQuota());
+    await waitFor(() => {
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1000, 6);
+      expect(result.current.get("seven_day")?.quotaUsd).toBeCloseTo(3000, 6);
+    });
+  });
+
+  it("shows the seed before the first measurable sample, then folds that sample", async () => {
+    queryHistory.mockResolvedValue(historySeeding1000);
+    getModelStats.mockResolvedValue(modelStats(0));
+    const { result, rerender } = renderEstimates("claude", liveQuota());
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1000, 6),
+    );
+
+    // 同一份快照重查到 C=$50：要折进去，成为下一格的起点
+    getModelStats.mockResolvedValue(modelStats(50));
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["quotaEstimate"] });
+    });
     await settle();
-    expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1000, 6);
+
+    // 下一份快照 C=$70、U=11：从 $50、10% 起算结算 {20, 1}，EMA 到 $1500。
+    // 若上一步被种子记录挡掉，这一样本只开段，停在 $1000。
+    getModelStats.mockResolvedValue(modelStats(70));
+    rerender({ current: liveQuota(11, NEXT_QUERIED_AT) });
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1500, 6),
+    );
   });
 
   it("skips windows whose reset time has already passed", async () => {
