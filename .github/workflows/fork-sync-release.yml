@@ -53,6 +53,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # The rebase regenerates pnpm-lock.yaml when it is the only conflicted
+      # file (the fork's dependency overrides live in pnpm-workspace.yaml), so
+      # pnpm must be available before rebasing.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+          run_install: false
+
       - name: Rebase onto upstream
         id: rebase
         run: |
@@ -61,29 +75,44 @@ jobs:
           git fetch upstream "$UPSTREAM_BRANCH"
           changed=false
           conflict=false
+          files=""
+          conflict_list="$RUNNER_TEMP/conflicts.txt"
           if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
             echo "No new upstream commits — nothing to rebase."
-          elif git rebase "upstream/$UPSTREAM_BRANCH"; then
+          elif CONFLICT_FILES="$conflict_list" bash .github/scripts/fork-rebase.sh "upstream/$UPSTREAM_BRANCH"; then
             git push --force-with-lease origin "HEAD:$FEATURE_BRANCH"
             changed=true
             echo "Rebased onto upstream and force-pushed $FEATURE_BRANCH."
           else
-            git rebase --abort || true
             conflict=true
-            echo "::warning::Rebase onto upstream hit conflicts; manual resolution needed."
+            files=$(tr '\n' ' ' < "$conflict_list" 2>/dev/null || true)
+            echo "::warning::Rebase onto upstream hit conflicts in: $files"
           fi
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
           echo "conflict=$conflict" >> "$GITHUB_OUTPUT"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
 
       - name: Open issue on conflict
         if: steps.rebase.outputs.conflict == 'true'
         uses: actions/github-script@v7
+        env:
+          CONFLICTED: ${{ steps.rebase.outputs.files }}
         with:
           script: |
             const title = "Auto-rebase failed: feature branch conflicts with upstream";
             const { owner, repo } = context.repo;
+            const conflicted = "Conflicted files: `" + (process.env.CONFLICTED.trim() || "unknown") + "`";
             const open = await github.rest.issues.listForRepo({ owner, repo, state: "open", per_page: 100 });
-            if (open.data.some((i) => i.title === title)) return;
+            const existing = open.data.find((i) => i.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: "Still conflicting as of run " + context.runId + ". " + conflicted,
+              });
+              return;
+            }
             await github.rest.issues.create({
               owner,
               repo,
@@ -91,7 +120,10 @@ jobs:
               body: [
                 "The scheduled `Fork sync & release` workflow could not rebase",
                 "`" + process.env.FEATURE_BRANCH + "` onto `upstream/" + process.env.UPSTREAM_BRANCH + "`",
-                "because of conflicts.",
+                "because of conflicts. A conflict confined to `pnpm-lock.yaml` is",
+                "regenerated automatically, so these need a human.",
+                "",
+                conflicted,
                 "",
                 "Resolve locally:",
                 "```",
