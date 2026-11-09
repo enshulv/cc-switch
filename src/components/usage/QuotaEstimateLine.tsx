@@ -3,7 +3,7 @@ import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 import type { SubscriptionQuota } from "@/types/subscription";
 import { useMoneyFormat } from "@/hooks/useMoneyFormat";
-import { useQuotaEstimates } from "@/components/usage/quotaEstimate";
+import { useQuotaEstimates } from "@/components/usage/useQuotaEstimates";
 
 /**
  * Fork-only: the reverse-computed dollar quota per window, rendered as one
@@ -14,10 +14,10 @@ import { useQuotaEstimates } from "@/components/usage/quotaEstimate";
  * footer wrappers call this hook (they are always mounted and already sit under
  * a QueryClient) and hand the node to `SubscriptionQuotaView` as a prop; the
  * view itself stays hook-free, so upstream tests that render it bare still
- * pass, and the estimator's accumulated deltas survive a failed refresh.
+ * pass, and the estimator state survives a failed refresh.
  *
- * Returns null until at least one window's estimate has passed its gate, and
- * always for apps other than Claude / Codex.
+ * Returns null until at least one window has an estimate, and always for apps
+ * other than Claude / Codex.
  */
 export function useQuotaEstimateLine(
   appId: string | undefined,
