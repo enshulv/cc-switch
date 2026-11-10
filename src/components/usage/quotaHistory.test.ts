@@ -56,7 +56,7 @@ function row(
 
 /**
  * 一条会收敛的序列：额度恰好 $1000（U 每步 +10，C 每步 +$100）。
- * 第 2 个点结算出第一段，斜率 100·ΔC/ΔU = 1000。
+ * 第 2 个点是本段第一格，丢弃；第 3 个点结算出第一段，比值 100·ΔC/ΔU = 1000。
  */
 function convergingRows(tier = "five_hour"): QuotaHistoryRow[] {
   return [10, 20, 30].map((u, i) =>
@@ -165,33 +165,40 @@ describe("replayTierEstimates", () => {
       { u: 20, c: 200 },
       { u: 30, c: 300 },
     ]);
-    expect(out[0]).toBeNull(); // 首点只开段，还没有结算出任何段
-    expect(out[1]).toBeCloseTo(1000, 6);
+    expect(out[0]).toBeNull(); // 首点只开段
+    expect(out[1]).toBeNull(); // 本段第一格丢弃
     expect(out[2]).toBeCloseTo(1000, 6);
   });
 
-  it("estimates from the first settled one-point step", () => {
+  it("drops the first one-point step and estimates from the second", () => {
     const { estimates } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 11, c: 110 },
+      { u: 12, c: 120 },
     ]);
     expect(estimates[0]).toBeNull();
-    expect(estimates[1]).toBeCloseTo(1000, 6);
+    expect(estimates[1]).toBeNull();
+    expect(estimates[2]).toBeCloseTo(1000, 6);
   });
 
   it("holds the last value across rows that carry no measured spend", () => {
     const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
-      { u: 25, c: null },
+      { u: 30, c: 300 },
+      { u: 35, c: null },
     ]);
-    expect(out[2]).toBe(out[1]);
+    expect(out[2]).toBeCloseTo(1000, 6);
+    expect(out[3]).toBe(out[2]);
   });
 
-  it("starts a fresh segment after a window reset instead of folding across it", () => {
-    // 前三点确立 $1000。随后 U 从 30 骤降到 2（窗口重置），新段的真实额度是 $2000
-    // （U 每 +10 对应 C 每 +$200）。本用例只看 EMA 朝新斜率走；重置时旧段是否真被清空，
-    // 回放层看不出来（旧段年龄 10pp，权重不到 1%），由 foldQuotaSample 的重置用例断言整个状态。
+  it("keeps the spans across a window reset and drops the first step after it", () => {
+    // 前三点结算 {100, 10}，得 $1000。随后 U 从 30 骤降到 2（窗口重置），新窗口的真实额度
+    // 是 $2000（U 每 +10 对应 C 每 +$200）。手算 EMA（α=0.5）：
+    //   重置点：旧段留着，max(100·100/10, 100·20/2) = 1000，EMA 1000；
+    //   2→12 是重置后第一格，丢弃：max(1000, 100·220/12 ≈ 1833.3)，EMA ≈ 1416.7；
+    //   12→22 结算 {200, 10}，裁剪后只剩它：max(2000, 1909.1)，EMA ≈ 1708.3。
+    // 重置清段的话重置点与第一格都没有段，EMA 停在 1000；第一格不丢的话第 5 点就到 1500。
     const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
@@ -201,22 +208,23 @@ describe("replayTierEstimates", () => {
       { u: 22, c: 420 },
     ]);
     expect(out[2]).toBeCloseTo(1000, 6);
-    // 新段自己的斜率是 100·200/10 = 2000，EMA 从 1000 朝 2000 走
-    expect(out[4]).toBeGreaterThan(1300);
-    expect(out[5]).toBeGreaterThan(out[4]!);
-    expect(out[5]).toBeLessThanOrEqual(2000);
+    expect(out[3]).toBeCloseTo(1000, 6);
+    expect(out[4]).toBeCloseTo(1416.667, 2);
+    expect(out[5]).toBeCloseTo(1708.333, 2);
   });
 
   it("ignores intervals where the window moved without local spend", () => {
-    // 账号在别的设备上烧掉了 20 个百分点（ΔU>0 但 ΔC=0）。这一格不结算成段、锚点前移到 30，
-    // 下一格只按 30→40 结算 {$100, 10pp}。若把无本机花费的一格也推成段 {0, 20}，
-    // EMA 先被拉到下界 $333，最后一点只到约 $667。
+    // 5→10 是本段第一格，丢弃。之后账号在别的设备上烧掉了 20 个百分点（ΔU>0 但 ΔC=0）。
+    // 这一格不结算成段、锚点前移到 30，下一格只按 30→40 结算 {$100, 10pp}。
+    // 若把无本机花费的一格也推成段 {0, 20}，EMA 先被拉到下界 $333，最后一点只到约 $667。
     const { estimates: out } = replayTierEstimates([
+      { u: 5, c: 50 },
       { u: 10, c: 100 },
       { u: 30, c: 100 },
       { u: 40, c: 200 },
     ]);
-    expect(out[2]).toBeCloseTo(1000, 6);
+    expect(out[2]).toBeNull();
+    expect(out[3]).toBeCloseTo(1000, 6);
   });
 
   it("returns the state after the last sample", () => {
@@ -235,15 +243,17 @@ describe("replayTierEstimates", () => {
     const { state: seed } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
+      { u: 30, c: 300 },
     ]);
     const { estimates } = replayTierEstimates(
       [
-        { u: 30, c: null },
-        { u: 30, c: 300 },
+        { u: 40, c: null },
+        { u: 40, c: 400 },
       ],
       seed,
     );
-    // 无花费的占位点输出种子的 display；下一点接着种子的段往下折，结算出 $1000
+    // 无花费的占位点输出种子的 display；下一点接着种子的段往下折，结算出 $1000。
+    // 不接种子的话这一点只开段，是 null
     expect(estimates[0]).toBeCloseTo(1000, 6);
     expect(estimates[1]).toBeCloseTo(1000, 6);
   });
@@ -258,7 +268,9 @@ describe("replayTierEstimates", () => {
       { u: 10, c: 89.2 },
       { u: 20, c: 190.6 },
     ]);
-    for (const value of estimates.slice(3)) {
+    // 重置后第一格 1→2 丢弃，第 4 点起才有段
+    expect(estimates[3]).toBeNull();
+    for (const value of estimates.slice(4)) {
       expect(value).not.toBeNull();
       expect(value!).toBeLessThan(1100);
     }
@@ -266,37 +278,40 @@ describe("replayTierEstimates", () => {
 
   it("keeps the estimate steady while C still carries the previous window's spend", () => {
     // 真实形状：U 53→0→0→2→3，C 1996→2031→2051→2086→2192，之后 C 跌到 5。
-    // U=2 那点检测到重置，100·C/U 是估算值的 26 倍，进入 stale；C 跌到 5 时退出。
+    // U=0 的点回放时跳过。U=2 那点检测到重置，100·C/U 是估算值的 26 倍，进入 stale；
+    // C 跌到 5 时退出，旧段 {160, 4} 留着。
     const { estimates } = replayTierEstimates([
-      { u: 52, c: 1956 },
-      { u: 53, c: 1996 }, // 结算 $40/1pp，得 $4000
+      { u: 48, c: 1796 },
+      { u: 49, c: 1836 }, // 本段第一格，丢弃
+      { u: 53, c: 1996 }, // 结算 {160, 4}，得 $4000
       { u: 0, c: 2031 },
       { u: 0, c: 2051 },
       { u: 2, c: 2086 },
       { u: 3, c: 2192 },
       { u: 4, c: 5 },
-      { u: 5, c: 65 }, // 新窗口 $60/1pp，EMA 从 4000 走一半
+      { u: 5, c: 65 }, // 退出 stale 后第一格，丢弃
+      { u: 6, c: 125 }, // {60, 1} 凑满 5pp：100·220/5 = 4400，EMA 从 4000 走一半
     ]);
-    expect(estimates[1]).toBeCloseTo(4000, 6);
-    for (const value of estimates.slice(2, 7)) {
+    expect(estimates[2]).toBeCloseTo(4000, 6);
+    for (const value of estimates.slice(3, 9)) {
       expect(value).toBeCloseTo(4000, 6);
     }
-    expect(estimates[7]).toBeCloseTo(5000, 6);
+    expect(estimates[9]).toBeCloseTo(4200, 6);
   });
 
   it("skips samples with zero utilization", () => {
-    // U=0、C=$5 若被折入，会当成 C 回落的重置把段清空，下一点只按 0→21 结算。
+    // U=0、C=$5 若被折入，会当成 C 回落的重置，0→21 成了重置后第一格被丢弃，
+    // 最后一点只是 max(1000, 累积下界 1095.2) 折一半，约 1047.6。
     const { estimates } = replayTierEstimates([
+      { u: 5, c: 50 },
       { u: 10, c: 100 },
       { u: 20, c: 200 },
       { u: 0, c: 5 },
       { u: 21, c: 230 },
     ]);
-    expect(estimates[2]).toBeCloseTo(1000, 6);
-    // 段 {100, 10}、{30, 1}：recent = 100·(30 + 100w)/(1 + 10w)，w = 0.5^(1/1.5)
-    const w = 0.5 ** (1 / 1.5);
-    const recent = (100 * (30 + 100 * w)) / (1 + 10 * w);
-    expect(estimates[3]).toBeCloseTo(1000 + 0.5 * (recent - 1000), 6);
+    expect(estimates[3]).toBeCloseTo(1000, 6);
+    // 段 {100, 10}、{30, 1}：段比值 100·130/11 ≈ 1181.8，EMA 从 1000 走一半
+    expect(estimates[4]).toBeCloseTo(1000 + 0.5 * (13000 / 11 - 1000), 6);
   });
 });
 
@@ -309,8 +324,9 @@ describe("rowsToSeries", () => {
     expect(warmingUp).toBe(false);
     expect(rows[0].ts).toBe(hourStartMs(10));
     expect(rows[0].five_hour).toBeNull(); // 首点未收敛
-    expect(rows[1].five_hour).toBeCloseTo(1000, 6);
+    expect(rows[1].five_hour).toBeNull(); // 本段第一格丢弃
     expect(rows[1][utilKey("five_hour")]).toBe(20);
+    expect(rows[2].five_hour).toBeCloseTo(1000, 6);
   });
 
   it("flags warming-up when nothing converged yet", () => {
@@ -329,8 +345,8 @@ describe("rowsToSeries", () => {
     ];
     const series = rowsToSeries(rows, "claude");
     expect(series.tiers.sort()).toEqual(["five_hour", "seven_day"]);
-    expect(series.rows[1].five_hour).toBeCloseTo(1000, 6);
-    expect(series.rows[1].seven_day).toBeCloseTo(1000, 6);
+    expect(series.rows[2].five_hour).toBeCloseTo(1000, 6);
+    expect(series.rows[2].seven_day).toBeCloseTo(1000, 6);
   });
 
   it("inserts a null row so long gaps break the line", () => {
@@ -380,31 +396,12 @@ describe("rowsToSeries", () => {
   });
 
   it("sorts hours that arrive out of order before replaying them", () => {
-    // 断言值而不只是 ts：顺序反了的话 dU 变成负数、什么都不累加，两点都会是 null。
+    // 断言值而不只是 ts：不排序的话 30→10 被当成重置，10→20 是重置后第一格，最后一点是 null。
     const { rows } = rowsToSeries(
       [
         row(12, "five_hour", 30, { spendUsd: 300 }),
+        row(10, "five_hour", 10, { spendUsd: 100 }),
         row(11, "five_hour", 20, { spendUsd: 200 }),
-      ],
-      "claude",
-    );
-    expect(rows.map((r) => r.ts)).toEqual([hourStartMs(11), hourStartMs(12)]);
-    expect(rows[1].five_hour).toBeCloseTo(1000, 6);
-  });
-
-  it("carries the estimate across a gap without folding the gap's deltas", () => {
-    // 断档前确立 $1000（U 24→25 花 $10）。停机期间窗口滚过，重开后 U=45、C=$90：
-    // U 不降反升，重置判定碰不到，只有断档切段能挡住跨断档的差值。
-    // 切段沿用：断档后第一点只开新段，显示沿用 $1000；下一点结算 $300/10pp 即 $3000，
-    //   EMA 从 $1000 走一半到 $2000。
-    // 跨断档硬折：第一点结算 {79, 20}，EMA 被拉到约 $698。
-    // 从零开始：第一点是 null，第二点是 $3000。
-    const { rows } = rowsToSeries(
-      [
-        row(10, "five_hour", 24, { spendUsd: 1 }),
-        row(11, "five_hour", 25, { spendUsd: 11 }),
-        row(30, "five_hour", 45, { spendUsd: 90 }),
-        row(31, "five_hour", 55, { spendUsd: 390 }),
       ],
       "claude",
     );
@@ -412,20 +409,52 @@ describe("rowsToSeries", () => {
       hourStartMs(10),
       hourStartMs(11),
       hourStartMs(12),
+    ]);
+    expect(rows[2].five_hour).toBeCloseTo(1000, 6);
+  });
+
+  it("carries the estimate across a gap without folding the gap's deltas", () => {
+    // 断档前 20→21 是本段第一格，丢弃；21→26 结算 {50, 5}，确立 $1000。
+    // 停机期间窗口滚过，重开后 U=45、C=$90：U 不降反升，重置判定碰不到，只有断档切段能挡住
+    // 跨断档的差值。
+    // 切段沿用：断档后第一点只开新段；45→55 是新段第一格，丢弃；两点都按旧段 {50, 5} 估，
+    //   显示 $1000。55→60 结算 {150, 5}，裁剪后只剩它，$3000，EMA 从 $1000 走一半到 $2000。
+    // 跨断档硬折：第一点结算 {20, 19}，EMA 被拉到 $600。
+    // 从零开始：断档后第一点是 null。
+    const { rows } = rowsToSeries(
+      [
+        row(10, "five_hour", 20, { spendUsd: 10 }),
+        row(11, "five_hour", 21, { spendUsd: 20 }),
+        row(12, "five_hour", 26, { spendUsd: 70 }),
+        row(30, "five_hour", 45, { spendUsd: 90 }),
+        row(31, "five_hour", 55, { spendUsd: 390 }),
+        row(32, "five_hour", 60, { spendUsd: 540 }),
+      ],
+      "claude",
+    );
+    expect(rows.map((r) => r.ts)).toEqual([
+      hourStartMs(10),
+      hourStartMs(11),
+      hourStartMs(12),
+      hourStartMs(13),
       hourStartMs(30),
       hourStartMs(31),
+      hourStartMs(32),
     ]);
-    expect(rows[1].five_hour).toBeCloseTo(1000, 6);
-    expect(rows[2].five_hour).toBeNull(); // 断线行
-    expect(rows[3].five_hour).toBeCloseTo(1000, 6);
-    expect(rows[4].five_hour).toBeCloseTo(2000, 6);
+    expect(rows[1].five_hour).toBeNull();
+    expect(rows[2].five_hour).toBeCloseTo(1000, 6);
+    expect(rows[3].five_hour).toBeNull(); // 断线行
+    expect(rows[4].five_hour).toBeCloseTo(1000, 6);
+    expect(rows[5].five_hour).toBeCloseTo(1000, 6);
+    expect(rows[6].five_hour).toBeCloseTo(2000, 6);
   });
 
   it("skips rows that measured zero spend", () => {
     // 探针在窗口内本机没花钱时写 spendUsd = 0。折入的话 C 从 $200 掉到 0，
-    // 会被当成重置，h13 从 0 起算结算出 {230, 1}，估算冲到上万。
+    // 会被当成重置，h13 成了重置后第一格被丢弃，只按累积下界折到约 $1047.6。
     const { rows } = rowsToSeries(
       [
+        row(9, "five_hour", 5, { spendUsd: 50 }),
         row(10, "five_hour", 10, { spendUsd: 100 }),
         row(11, "five_hour", 20, { spendUsd: 200 }),
         row(12, "five_hour", 20, { spendUsd: 0 }),
@@ -433,10 +462,9 @@ describe("rowsToSeries", () => {
       ],
       "claude",
     );
-    expect(rows[2].five_hour).toBeCloseTo(1000, 6);
-    const w = 0.5 ** (1 / 1.5);
-    const recent = (100 * (30 + 100 * w)) / (1 + 10 * w);
-    expect(rows[3].five_hour).toBeCloseTo(1000 + 0.5 * (recent - 1000), 6);
+    expect(rows[3].five_hour).toBeCloseTo(1000, 6);
+    // 段 {100, 10}、{30, 1}：段比值 100·130/11 ≈ 1181.8，EMA 从 1000 走一半
+    expect(rows[4].five_hour).toBeCloseTo(1000 + 0.5 * (13000 / 11 - 1000), 6);
   });
 
   it("keeps ignoring stale spend across a gap", () => {
@@ -444,7 +472,8 @@ describe("rowsToSeries", () => {
     // 而且跨过了断档。断档后若不再忽略这些样本，C/U 会冲到上万。
     const { rows } = rowsToSeries(
       [
-        row(10, "seven_day", 80, { spendUsd: 800 }),
+        row(9, "seven_day", 79, { spendUsd: 780 }),
+        row(10, "seven_day", 80, { spendUsd: 800 }), // 本段第一格，丢弃
         row(11, "seven_day", 81, { spendUsd: 820 }), // 结算 $20/1pp，得 $2000
         row(12, "seven_day", 2, { spendUsd: 920 }), // 重置，C 没回落：进入 stale
         row(13, "seven_day", 3, { spendUsd: 960 }),
@@ -453,9 +482,9 @@ describe("rowsToSeries", () => {
       ],
       "claude",
     );
-    // rows = [h10, h11, h12, h13, 断档行, h16, h17]
-    expect(rows[4].seven_day).toBeNull();
-    for (const index of [1, 2, 3, 5, 6]) {
+    // rows = [h9, h10, h11, h12, h13, 断档行, h16, h17]
+    expect(rows[5].seven_day).toBeNull();
+    for (const index of [2, 3, 4, 6, 7]) {
       expect(rows[index].seven_day).toBeCloseTo(2000, 6);
     }
   });
@@ -494,7 +523,8 @@ describe("latestTierEstimates", () => {
     const rows = [
       row(10, "five_hour", 10, { spendUsd: 100 }),
       row(11, "five_hour", 20, { spendUsd: 200 }),
-      row(12, "five_hour", 21, { spendUsd: 230 }), // $30/1pp，拉高 EMA
+      row(12, "five_hour", 21, { spendUsd: 230 }), // $30/1pp
+      row(9, "seven_day", 4, { spendUsd: 30 }),
       row(10, "seven_day", 5, { spendUsd: 50 }),
       row(11, "seven_day", 6, { spendUsd: 70 }),
       row(10, "premium", 10, { appId: "codex", spendUsd: 100 }),
@@ -513,6 +543,7 @@ describe("latestTierEstimates", () => {
   it("looks past hours where the window has no sample", () => {
     // seven_day 在最后一小时缺席，序列末尾是显式 null
     const rows = [
+      row(9, "seven_day", 4, { spendUsd: 30 }),
       row(10, "seven_day", 5, { spendUsd: 50 }),
       row(11, "seven_day", 6, { spendUsd: 70 }),
       row(12, "five_hour", 10, { spendUsd: 100 }),
@@ -524,6 +555,7 @@ describe("latestTierEstimates", () => {
 
   it("looks past the null row inserted at a gap", () => {
     const rows = [
+      row(9, "five_hour", 5, { spendUsd: 50 }),
       row(10, "five_hour", 10, { spendUsd: 100 }),
       row(11, "five_hour", 20, { spendUsd: 200 }),
       row(30, "seven_day", 5, { spendUsd: 50 }),

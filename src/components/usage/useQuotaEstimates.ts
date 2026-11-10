@@ -16,6 +16,7 @@ import {
   type EstimatorState,
 } from "./quotaEstimate";
 import { hourIndex, latestTierEstimates } from "./quotaHistory";
+import { ensureFreshSessionUsage } from "./freshSessionUsage";
 
 const DAY_MS = 86_400_000;
 const SEED_HISTORY_DAYS = 14;
@@ -67,12 +68,14 @@ export function useQuotaEstimates(
       // avoiding render churn. start in the key: bust the cache when the
       // window start changes so a stale result is not reused.
       queryKey: ["quotaEstimate", appId, tier.name, queriedAt, start] as const,
-      queryFn: () =>
-        usageApi.getModelStats(
+      queryFn: async () => {
+        await ensureFreshSessionUsage();
+        return usageApi.getModelStats(
           start,
           Math.floor(nowMs / 1000),
           appId as EstimableApp,
-        ),
+        );
+      },
       enabled,
       staleTime: 5 * 60 * 1000,
     })),

@@ -11,7 +11,6 @@ import {
   foldQuotaSample,
   startNewSegment,
   seededEstimator,
-  RECENCY_HALF_LIFE_PP,
   type EstimatorState,
 } from "./quotaEstimate";
 
@@ -174,6 +173,7 @@ function estimator(overrides: Partial<EstimatorState> = {}): EstimatorState {
     prevC: null,
     anchorU: null,
     pendingDC: 0,
+    pastFirstStep: false,
     spans: [],
     stale: null,
     ema: null,
@@ -202,9 +202,6 @@ function lastOf<T>(items: T[]): T {
   return items[items.length - 1];
 }
 
-/** 契约的权重公式，半衰期写成字面量 1.5pp，不取被测模块的常数 */
-const recencyWeight = (age: number) => 0.5 ** (age / 1.5);
-
 describe("foldQuotaSample", () => {
   it("opens a segment on the first sample without producing an estimate", () => {
     const first = foldQuotaSample(null, 100, 10);
@@ -212,25 +209,32 @@ describe("foldQuotaSample", () => {
   });
 
   it("settles all spend since the last step of U into the span, not just the final interval", () => {
-    // U 是整数：C 涨了三次，U 才跳一格。跳格那个区间只花了 $15，整段花了 $40。
+    // 9→10 是本段第一格，丢弃。之后 U 是整数：C 涨了三次，U 才跳一格。
+    // 跳格那个区间只花了 $15，整段花了 $40。
     const states = foldEach(null, [
+      [90, 9],
       [100, 10],
       [110, 10],
       [125, 10],
       [140, 11],
     ]);
-    expect(states[2].pendingDC).toBe(25);
-    expect(states[2].spans).toEqual([]);
+    expect(states[1].spans).toEqual([]);
+    expect(states[1].pendingDC).toBe(0);
+    expect(states[1].anchorU).toBe(10);
+    expect(states[3].pendingDC).toBe(25);
+    expect(states[3].spans).toEqual([]);
     const settled = lastOf(states);
     expect(settled.spans).toEqual([{ dC: 40, dU: 1 }]);
     expect(settled.pendingDC).toBe(0);
     expect(settled.anchorU).toBe(11);
-    // recent = 100·40/1 = 4000，高于累积下界 100·140/11 ≈ 1273
+    // 段比值 = 100·40/1 = 4000，高于累积下界 100·140/11 ≈ 1273
     expect(settled.display).toBeCloseTo(4000, 6);
   });
 
   it("does not count a 52 → 51 → 52 jitter as a step of U", () => {
+    // 51→52 是本段第一格，丢弃；之后的 52→51→52 不算跳格
     const states = foldEach(null, [
+      [90, 51],
       [100, 52],
       [110, 51],
       [120, 52],
@@ -247,7 +251,7 @@ describe("foldQuotaSample", () => {
 
   it("treats a small drop of U with falling C as a window reset", () => {
     // 真实形状：5h 窗口在 U<20 时重置，U 14→5 时 C 102.0→37.4。窗口内 C 只增不减，
-    // C 回落只可能是重置；当抖动处理的话锚点停在 14，之后的涨幅少算 9 格。
+    // C 回落只可能是重置；当抖动处理的话锚点停在 14，最后一格结算出 {129, 10}。
     const states = foldEach(null, [
       [102.0, 14],
       [37.4, 5],
@@ -255,10 +259,9 @@ describe("foldQuotaSample", () => {
       [166.4, 24],
     ]);
     expect(states[1]).toEqual(estimator({ prevC: 37.4, anchorU: 5 }));
-    expect(states[2].spans).toHaveLength(1);
-    expect(states[2].spans[0].dU).toBe(9);
-    expect(states[2].spans[0].dC).toBeCloseTo(70.4, 9);
-    // 两段合计 19 格；丢掉最旧的 9 格后仍覆盖 10 格，所以只留最新一段
+    // 重置后第一格 5→14 丢弃
+    expect(states[2].spans).toEqual([]);
+    expect(states[2].anchorU).toBe(14);
     const final = lastOf(states);
     expect(final.spans).toHaveLength(1);
     expect(final.spans[0].dU).toBe(10);
@@ -267,7 +270,7 @@ describe("foldQuotaSample", () => {
 
   it("settles the full rise after a small-drop reset", () => {
     // 真实形状：U 12→1 时 C 166.9→8.0，之后 U 1→20 共涨 19 格。
-    // 当抖动处理的话最后只按 dU=8 结算 $182.6，估算膨胀到 $2282。
+    // 当抖动处理的话锚点停在 12，估算膨胀。
     const states = foldEach(null, [
       [166.9, 12],
       [8.0, 1],
@@ -279,25 +282,24 @@ describe("foldQuotaSample", () => {
     expect(states[1].anchorU).toBe(1);
     expect(states[1].stale).toBeNull();
 
-    // 逐步结算的段：1 + 8 + 10 = 19 格
-    expect(states[3].spans).toHaveLength(1);
-    expect(states[3].spans[0].dU).toBe(1);
-    expect(states[3].spans[0].dC).toBeCloseTo(5.3, 9);
-    expect(states[4].spans).toHaveLength(2);
-    expect(states[4].spans[1].dU).toBe(8);
-    expect(states[4].spans[1].dC).toBeCloseTo(75.9, 9);
+    // 重置后第一格 1→2 丢弃，之后逐格结算 8 + 10 格
+    expect(states[3].spans).toEqual([]);
+    expect(states[3].anchorU).toBe(2);
+    expect(states[4].spans).toHaveLength(1);
+    expect(states[4].spans[0].dU).toBe(8);
+    expect(states[4].spans[0].dC).toBeCloseTo(75.9, 9);
     const final = lastOf(states);
-    expect(lastOf(final.spans).dU).toBe(10);
-    expect(lastOf(final.spans).dC).toBeCloseTo(101.4, 9);
+    expect(final.spans).toHaveLength(1);
+    expect(final.spans[0].dU).toBe(10);
+    expect(final.spans[0].dC).toBeCloseTo(101.4, 9);
 
     // 手算 EMA（α=0.5）：
-    //   第 3 步只有 {5.3, 1}：recent 530，下界 100·13.3/2 = 665，EMA 665；
-    //   第 4 步 {5.3, 1}、{75.9, 8}：recent = 100·(75.9 + 5.3·2^(−16/3)) ÷ (8 + 2^(−16/3))
-    //     ≈ 947.456，EMA ≈ 806.228；
-    //   第 5 步先裁剪，只剩 {101.4, 10}：recent 1014，下界 953，EMA ≈ 910.114。
-    // 不裁剪就估算的话三段都带权重，EMA ≈ 909.853。
-    expect(final.ema).toBeCloseTo(910.114, 2);
-    expect(final.display).toBeCloseTo(910.114, 2);
+    //   第 4 步只有 {75.9, 8}：段比值 948.75，下界 100·89.2/10 = 892，EMA 948.75；
+    //   第 5 步先裁剪，丢掉 {75.9, 8} 后仍覆盖 10 格，只剩 {101.4, 10}：
+    //     段比值 1014，下界 953，EMA = 948.75 + 0.5·(1014 − 948.75) = 981.375。
+    expect(states[4].ema).toBeCloseTo(948.75, 6);
+    expect(final.ema).toBeCloseTo(981.375, 6);
+    expect(final.display).toBeCloseTo(981.375, 6);
   });
 
   it("treats a drop of one point as jitter and a drop of two as a reset", () => {
@@ -324,13 +326,16 @@ describe("foldQuotaSample", () => {
       prevC: 100,
       anchorU: 30,
       pendingDC: 4,
+      pastFirstStep: true,
       spans: [{ dC: 10, dU: 1 }],
       ema: 1000,
       display: 1000,
       baseline: 1000,
     });
+    // 重置清掉累积与第一格标记，段留着
     const reset = estimator({
       prevC: 99.4,
+      spans: [{ dC: 10, dU: 1 }],
       ema: 1000,
       display: 1000,
       baseline: 1000,
@@ -344,6 +349,7 @@ describe("foldQuotaSample", () => {
       prevC: 100,
       anchorU: 30,
       pendingDC: 4,
+      pastFirstStep: true,
       spans: [{ dC: 10, dU: 1 }],
     });
     // U 没跳格：负的 dC 不从累积里扣
@@ -364,10 +370,12 @@ describe("foldQuotaSample", () => {
 
   it("re-anchors on a small drop of U with C still rising", () => {
     // 多机：旧窗口本机只花了 $2，别台机器把 U 推到 18；新窗口本机先用，C 比旧窗口末尾高。
-    // 真实额度 $100（$1/pp）。不当重置的话锚点卡在 18，U=19 时结算出 {17, 1}。
+    // 真实额度 $100（$1/pp）。重置后 3→18 是第一格，丢弃；之后 {1, 1}、{4, 4} 凑满 5 格，
+    // 段比值 100。不当重置的话锚点卡在 18，U=19 时结算出 {17, 1}，凑满后段比值 420。
     const prev = estimator({
       prevC: 2,
       anchorU: 18,
+      pastFirstStep: true,
       ema: 100,
       display: 100,
       baseline: 100,
@@ -376,9 +384,20 @@ describe("foldQuotaSample", () => {
       [3, 3],
       [18, 18],
       [19, 19],
+      [23, 23],
     ]);
-    expect(states[0]).toEqual({ ...prev, prevC: 3, anchorU: 3 });
-    expect(lastOf(states).display).toBeCloseTo(100, 6);
+    expect(states[0]).toEqual({
+      ...prev,
+      prevC: 3,
+      anchorU: 3,
+      pastFirstStep: false,
+    });
+    const final = lastOf(states);
+    expect(final.spans).toEqual([
+      { dC: 1, dU: 1 },
+      { dC: 4, dU: 4 },
+    ]);
+    expect(final.display).toBeCloseTo(100, 6);
   });
 
   it("enters stale on a reset with no estimate only when U drops by more than 20 points", () => {
@@ -405,12 +424,18 @@ describe("foldQuotaSample", () => {
     const prev = estimator({
       prevC: 100,
       anchorU: 15,
+      pastFirstStep: true,
       spans: [{ dC: 10, dU: 1 }],
       ema: 1000,
       display: 1000,
       baseline: 1000,
     });
-    const kept = { ema: 1000, display: 1000, baseline: 1000 };
+    const kept = {
+      spans: [{ dC: 10, dU: 1 }],
+      ema: 1000,
+      display: 1000,
+      baseline: 1000,
+    };
 
     // 100·410/10 = 4100，是估算值的 4.1 倍
     expect(foldQuotaSample(prev, 410, 10)).toEqual(
@@ -427,9 +452,10 @@ describe("foldQuotaSample", () => {
   });
 
   it("moves the anchor without a span when U steps with no local spend", () => {
-    // 别台机器烧掉 2 个百分点，本机没花钱：不推段，锚点前移。
+    // 9→10 是本段第一格，丢弃。之后别台机器烧掉 2 个百分点，本机没花钱：不推段，锚点前移。
     const offDevice = lastOf(
       foldEach(null, [
+        [90, 9],
         [100, 10],
         [100, 12],
       ]),
@@ -444,47 +470,67 @@ describe("foldQuotaSample", () => {
     expect(next.display).toBeCloseTo(5000, 6);
   });
 
-  it("weights the newest span highest", () => {
-    // 两段各 1pp：旧段 $10（斜率 $1000），新段 $30（斜率 $3000）
+  it("weights every kept span equally", () => {
+    // 两段各 1pp：旧段 $10，新段 $30。等权比值 100·40/2 = 2000；
+    // 按新旧加权会偏向新段的 3000。累积下界 100·140/12 ≈ 1167。
     const prev = estimator({
       prevC: 110,
       anchorU: 11,
+      pastFirstStep: true,
       spans: [{ dC: 10, dU: 1 }],
     });
     const next = foldQuotaSample(prev, 140, 12);
-    const w = recencyWeight(1);
-    const expected = (100 * (30 + w * 10)) / (1 + w);
-    expect(RECENCY_HALF_LIFE_PP).toBe(1.5);
-    expect(expected).toBeCloseTo(2227.0, 1);
-    expect(next.ema).toBeCloseTo(expected, 6);
-    expect(next.display).toBeCloseTo(expected, 6);
     expect(next.spans).toEqual([
       { dC: 10, dU: 1 },
       { dC: 30, dU: 1 },
     ]);
+    expect(next.ema).toBeCloseTo(2000, 6);
+    expect(next.display).toBeCloseTo(2000, 6);
   });
 
-  it("ages each span by the percentage points of the spans newer than it", () => {
+  it("pools spend and points over spans of different sizes", () => {
+    // 100·(10 + 40 + 30)/(1 + 2 + 1) = 2000；逐段比值取平均会是 (1000 + 2000 + 3000)/3。
     const prev = estimator({
       prevC: 150,
       anchorU: 13,
+      pastFirstStep: true,
       spans: [
         { dC: 10, dU: 1 },
         { dC: 40, dU: 2 },
       ],
     });
     const next = foldQuotaSample(prev, 180, 14);
-    // 年龄：新段 0，中段 1（新段 1pp），旧段 3（新段 1pp 加中段 2pp）
-    const expected =
-      (100 * (30 + 40 * recencyWeight(1) + 10 * recencyWeight(3))) /
-      (1 + 2 * recencyWeight(1) + 1 * recencyWeight(3));
-    expect(next.ema).toBeCloseTo(expected, 6);
+    expect(next.ema).toBeCloseTo(2000, 6);
   });
 
-  it("floors the recent slope at the cumulative lower bound", () => {
-    const prev = estimator({ prevC: 1000, anchorU: 50 });
+  it("keeps an older span until the newer ones cover 5 percentage points", () => {
+    const prev = estimator({
+      prevC: 100,
+      anchorU: 10,
+      pastFirstStep: true,
+      spans: [{ dC: 100, dU: 1 }],
+    });
+    // 新段 3pp：丢掉旧段只剩 3pp，旧段留着。100·130/4 = 3250
+    const under = foldQuotaSample(prev, 130, 13);
+    expect(under.spans).toEqual([
+      { dC: 100, dU: 1 },
+      { dC: 30, dU: 3 },
+    ]);
+    expect(under.ema).toBeCloseTo(3250, 6);
+
+    // 再一段 2pp：丢掉旧段后正好剩 5pp，旧段丢。100·50/5 = 1000，EMA 走一半
+    const filled = foldQuotaSample(under, 150, 15);
+    expect(filled.spans).toEqual([
+      { dC: 30, dU: 3 },
+      { dC: 20, dU: 2 },
+    ]);
+    expect(filled.ema).toBeCloseTo(2125, 6);
+  });
+
+  it("floors the span ratio at the cumulative lower bound", () => {
+    const prev = estimator({ prevC: 1000, anchorU: 50, pastFirstStep: true });
     const next = foldQuotaSample(prev, 1005, 51);
-    // recent = 100·5/1 = 500，累积 = 100·1005/51 ≈ 1970.6
+    // 段比值 = 100·5/1 = 500，累积 = 100·1005/51 ≈ 1970.6
     expect(next.ema).toBeCloseTo((1005 / 51) * 100, 6);
   });
 
@@ -492,26 +538,29 @@ describe("foldQuotaSample", () => {
     const prev = estimator({
       prevC: 100,
       anchorU: 10,
+      pastFirstStep: true,
+      spans: [{ dC: 40, dU: 4 }],
       ema: 1000,
       display: 1000,
       baseline: 1000,
     });
-    // recent 1030，EMA 走一半到 1015，只偏 1.5%
-    const held = foldQuotaSample(prev, 110.3, 11);
+    // 段 {40, 4}、{11.5, 1}：段比值 1030，EMA 走一半到 1015，只偏 1.5%
+    const held = foldQuotaSample(prev, 111.5, 11);
     expect(held.ema).toBeCloseTo(1015, 6);
     expect(held.display).toBe(1000);
 
-    // 再一格 $10.9/1pp：两段加权 recent ≈ 1066.8，EMA ≈ 1040.9，偏出 2%，显示值跟上
-    const moved = foldQuotaSample(held, 121.2, 12);
-    expect(moved.ema).toBeCloseTo(1040.9, 0);
+    // 再一格 $12/1pp：段比值 100·63.5/6 ≈ 1058.3，EMA ≈ 1036.7，偏出 2%，显示值跟上
+    const moved = foldQuotaSample(held, 123.5, 12);
+    expect(moved.ema).toBeCloseTo(1036.667, 2);
     expect(moved.display).toBe(moved.ema);
   });
 
   it("estimates from the spans left after trimming", () => {
-    // 加上新一格共 11pp，最旧那段 {1000, 1} 要丢。用裁剪后的段，斜率全是 $1000/pp。
+    // 加上新一格共 11pp，最旧那段 {1000, 1} 要丢。用裁剪后的段，比值全是 $1000/pp。
     const prev = estimator({
       prevC: 100,
       anchorU: 20,
+      pastFirstStep: true,
       spans: [
         { dC: 1000, dU: 1 },
         { dC: 90, dU: 9 },
@@ -529,40 +578,55 @@ describe("foldQuotaSample", () => {
     const prev = estimator({
       prevC: 100,
       anchorU: 10,
+      pastFirstStep: true,
+      spans: [{ dC: 120, dU: 4 }],
       ema: 1000,
       display: 1000,
       baseline: 900,
     });
-    const next = foldQuotaSample(prev, 130, 11); // recent 3000
+    const next = foldQuotaSample(prev, 130, 11); // 段比值 100·150/5 = 3000
     expect(next.baseline).toBe(1000);
     expect(next.ema).toBeCloseTo(2000, 6);
     expect(next.display).toBeCloseTo(2000, 6);
   });
 
-  it("clears the spans but keeps the estimate when the window resets and C drops", () => {
+  it("keeps the spans and the estimate when the window resets and C drops", () => {
     const prev = estimator({
       prevC: 300,
       anchorU: 30,
       pendingDC: 5,
+      pastFirstStep: true,
       spans: [{ dC: 100, dU: 10 }],
       ema: 1000,
       display: 1000,
       baseline: 990,
     });
+    // 段覆盖 10pp，重置这一点照常折入：max(100·100/10, 100·20/2) = 1000
     const afterReset = foldQuotaSample(prev, 20, 2);
     expect(afterReset).toEqual(
       estimator({
         prevC: 20,
         anchorU: 2,
+        spans: [{ dC: 100, dU: 10 }],
         ema: 1000,
         display: 1000,
-        baseline: 990,
+        baseline: 1000,
       }),
     );
 
-    // 重置后的第一格只用重置后的花费
-    const next = foldQuotaSample(afterReset, 220, 12);
-    expect(next.spans).toEqual([{ dC: 200, dU: 10 }]);
+    // 重置后第一格丢弃，旧段留着
+    const firstStep = foldQuotaSample(afterReset, 30, 12);
+    expect(firstStep.spans).toEqual([{ dC: 100, dU: 10 }]);
+    expect(firstStep.pendingDC).toBe(0);
+    expect(firstStep.anchorU).toBe(12);
+
+    // 第二格 {40, 2} 和旧段一起算：100·140/12 ≈ 1166.7，EMA 从 1000 走一半
+    const secondStep = foldQuotaSample(firstStep, 70, 14);
+    expect(secondStep.spans).toEqual([
+      { dC: 100, dU: 10 },
+      { dC: 40, dU: 2 },
+    ]);
+    expect(secondStep.ema).toBeCloseTo(1083.333, 2);
   });
 
   it("ignores samples while C still carries the previous window's spend", () => {
@@ -570,7 +634,8 @@ describe("foldQuotaSample", () => {
     const prev = estimator({
       prevC: 1996,
       anchorU: 53,
-      spans: [{ dC: 40, dU: 1 }],
+      pastFirstStep: true,
+      spans: [{ dC: 160, dU: 4 }],
       ema: 4000,
       display: 4000,
       baseline: 4000,
@@ -585,6 +650,7 @@ describe("foldQuotaSample", () => {
       estimator({
         prevC: 1996,
         anchorU: 0,
+        spans: [{ dC: 160, dU: 4 }],
         stale: { refC: 1996 },
         ema: 4000,
         display: 4000,
@@ -595,22 +661,31 @@ describe("foldQuotaSample", () => {
       expect(state).toEqual(staleStates[0]);
     }
 
-    // C 跌破重置前的最后一个可信值：已改按新窗口量，从这里开新段
+    // C 跌破重置前的最后一个可信值：已改按新窗口量，从这里开新段，段留着
     const recovered = foldQuotaSample(lastOf(staleStates), 5, 4);
     expect(recovered).toEqual(
       estimator({
         prevC: 5,
         anchorU: 4,
+        spans: [{ dC: 160, dU: 4 }],
         ema: 4000,
         display: 4000,
         baseline: 4000,
       }),
     );
 
-    // 之后照常估算：recent = 100·60/1 = 6000，EMA 从 4000 走一半
-    const resumed = foldQuotaSample(recovered, 65, 5);
-    expect(resumed.spans).toEqual([{ dC: 60, dU: 1 }]);
-    expect(resumed.display).toBeCloseTo(5000, 6);
+    // 新段第一格丢弃；段只覆盖 4pp，估算不动
+    const dropped = foldQuotaSample(recovered, 65, 5);
+    expect(dropped.spans).toEqual([{ dC: 160, dU: 4 }]);
+    expect(dropped.display).toBe(4000);
+
+    // 第二格 {60, 1} 凑满 5pp：100·220/5 = 4400，EMA 从 4000 走一半
+    const resumed = foldQuotaSample(dropped, 125, 6);
+    expect(resumed.spans).toEqual([
+      { dC: 160, dU: 4 },
+      { dC: 60, dU: 1 },
+    ]);
+    expect(resumed.display).toBeCloseTo(4200, 6);
   });
 
   it("only takes the cumulative bootstrap when provisional is allowed and nothing is estimated yet", () => {
@@ -638,22 +713,24 @@ describe("foldQuotaSample", () => {
     );
   });
 
-  it("keeps only the newest spans that still cover 10 percentage points", () => {
+  it("keeps only the newest spans that still cover 5 percentage points", () => {
+    // 20 格各 1pp、$10：第一格丢弃，余下 19 段裁到最新 5 段
     const samples: Array<[number, number]> = [[100, 10]];
     for (let k = 1; k <= 20; k++) samples.push([100 + 10 * k, 10 + k]);
     const final = lastOf(foldEach(null, samples));
-    expect(final.spans).toHaveLength(10);
+    expect(final.spans).toHaveLength(5);
     expect(final.spans.every((s) => s.dC === 10 && s.dU === 1)).toBe(true);
     expect(final.display).toBeCloseTo(1000, 6);
   });
 
   it("keeps the newest 64 spans", () => {
-    // 第 k 格 U 涨 0.1、花 $k，100 格合计 10pp，覆盖规则一段都不丢，只有上限起作用
+    // 第 k 格 U 涨 0.05、花 $k。第一格丢弃，余下 99 格合计 4.95pp，
+    // 覆盖规则一段都不丢，只有上限起作用
     const samples: Array<[number, number]> = [[100, 10]];
     let cost = 100;
     for (let k = 1; k <= 100; k++) {
       cost += k;
-      samples.push([cost, 10 + k / 10]);
+      samples.push([cost, 10 + k / 20]);
     }
     const final = lastOf(foldEach(null, samples));
     expect(final.spans).toHaveLength(64);
@@ -667,12 +744,164 @@ describe("foldQuotaSample", () => {
       prevC: 110,
       anchorU: 11,
       pendingDC: 3,
+      pastFirstStep: true,
       spans: [{ dC: 10, dU: 1 }],
     });
     const snapshot = structuredClone(prev);
     foldQuotaSample(prev, 140, 12);
     foldQuotaSample(prev, 120, 11);
+    foldQuotaSample(prev, 50, 2);
     expect(prev).toEqual(snapshot);
+  });
+});
+
+describe("foldQuotaSample: the first step of a segment", () => {
+  /** 段中途的状态：已越过第一格，带一段旧段 */
+  const midSegment = estimator({
+    prevC: 300,
+    anchorU: 30,
+    pastFirstStep: true,
+    spans: [{ dC: 10, dU: 1 }],
+  });
+
+  // 每种入口都在 C=100、U=10 建立锚点
+  const entries: Array<[string, () => EstimatorState]> = [
+    ["a fresh state", () => foldQuotaSample(null, 100, 10)],
+    ["a seeded state", () => foldQuotaSample(seededEstimator(1000), 100, 10)],
+    [
+      "a recording gap",
+      () => foldQuotaSample(startNewSegment(midSegment), 100, 10),
+    ],
+    ["a window reset", () => foldQuotaSample(midSegment, 100, 10)],
+    [
+      "leaving stale",
+      () =>
+        foldQuotaSample(
+          { ...midSegment, anchorU: 2, stale: { refC: 300 } },
+          100,
+          10,
+        ),
+    ],
+  ];
+
+  it.each(entries)(
+    "drops the first step after %s and settles the second",
+    (_, open) => {
+      const opened = open();
+      expect(opened.prevC).toBe(100);
+      expect(opened.anchorU).toBe(10);
+      expect(opened.pastFirstStep).toBe(false);
+      const spansBefore = opened.spans;
+
+      const held = foldQuotaSample(opened, 110, 10);
+      expect(held.pendingDC).toBe(10);
+
+      const first = foldQuotaSample(held, 130, 11);
+      expect(first.spans).toEqual(spansBefore);
+      expect(first.pendingDC).toBe(0);
+      expect(first.anchorU).toBe(11);
+      expect(first.pastFirstStep).toBe(true);
+
+      const second = foldQuotaSample(first, 150, 12);
+      expect(second.spans).toEqual([...spansBefore, { dC: 20, dU: 1 }]);
+    },
+  );
+
+  it("keeps the spans from before a gap, a reset or stale", () => {
+    expect(foldQuotaSample(startNewSegment(midSegment), 100, 10).spans).toEqual(
+      midSegment.spans,
+    );
+    expect(foldQuotaSample(midSegment, 100, 10).spans).toEqual(
+      midSegment.spans,
+    );
+    const entered = foldQuotaSample(
+      { ...midSegment, ema: 100, display: 100, baseline: 100 },
+      400,
+      2,
+    );
+    expect(entered.stale).toEqual({ refC: 300 });
+    expect(entered.spans).toEqual(midSegment.spans);
+  });
+
+  it("counts a first rise with no local spend as the first step", () => {
+    const states = foldEach(null, [
+      [100, 10],
+      [100, 12],
+      [130, 13],
+    ]);
+    expect(states[1].spans).toEqual([]);
+    expect(states[1].anchorU).toBe(12);
+    expect(lastOf(states).spans).toEqual([{ dC: 30, dU: 1 }]);
+  });
+
+  it("estimates from spans settled before a gap once the window fills", () => {
+    // 断档前 {400, 4}（$10000）。断档后第一格丢弃，第二格 {10, 1} 凑满 5pp：
+    // 100·410/5 = 8200，EMA 从 10000 走一半到 9100。
+    const prev = estimator({
+      prevC: 300,
+      anchorU: 30,
+      pastFirstStep: true,
+      spans: [{ dC: 400, dU: 4 }],
+      ema: 10000,
+      display: 10000,
+      baseline: 10000,
+    });
+    const states = foldEach(startNewSegment(prev), [
+      [10, 45],
+      [20, 46],
+      [30, 47],
+    ]);
+    expect(states[0].display).toBe(10000);
+    expect(states[1].spans).toEqual([{ dC: 400, dU: 4 }]);
+    expect(states[1].display).toBe(10000);
+    expect(states[2].spans).toEqual([
+      { dC: 400, dU: 4 },
+      { dC: 10, dU: 1 },
+    ]);
+    expect(states[2].ema).toBeCloseTo(9100, 6);
+  });
+});
+
+describe("foldQuotaSample: an estimate waits for 5 points of spans", () => {
+  it("holds the estimate until the kept spans cover 5 points, then folds", () => {
+    // 种子 $1000。10→11 是第一格，丢弃；之后每格 {20, 1}，第 5 段凑满 5pp：
+    // 段比值 2000，累积下界 100·210/16 ≈ 1313，EMA 走一半到 1500。
+    const states = foldEach(seededEstimator(1000), [
+      [100, 10],
+      [110, 11],
+      [130, 12],
+      [150, 13],
+      [170, 14],
+      [190, 15],
+      [210, 16],
+    ]);
+    for (const state of states.slice(0, 6)) {
+      expect(state.ema).toBe(1000);
+      expect(state.display).toBe(1000);
+      expect(state.baseline).toBe(1000);
+    }
+    // 估算不动时段照常推进
+    expect(states.slice(1, 6).map((s) => s.spans.length)).toEqual([
+      0, 1, 2, 3, 4,
+    ]);
+    expect(states[5].prevC).toBe(190);
+    expect(states[5].anchorU).toBe(15);
+
+    const filled = lastOf(states);
+    expect(filled.spans).toHaveLength(5);
+    expect(filled.ema).toBeCloseTo(1500, 6);
+    expect(filled.display).toBeCloseTo(1500, 6);
+    expect(filled.baseline).toBe(1000);
+  });
+
+  it("estimates from fewer than 5 points of spans when there is no estimate yet", () => {
+    const states = foldEach(null, [
+      [100, 10],
+      [110, 11],
+      [130, 12],
+    ]);
+    // 段 {20, 1}：段比值 2000，累积下界 100·130/12 ≈ 1083
+    expect(lastOf(states).display).toBeCloseTo(2000, 6);
   });
 });
 
@@ -702,11 +931,12 @@ describe("startNewSegment", () => {
     expect(startNewSegment(null)).toBeNull();
   });
 
-  it("clears the segment but keeps the estimate and the stale marker", () => {
+  it("clears the segment but keeps the spans, the estimate and the stale marker", () => {
     const prev = estimator({
       prevC: 300,
       anchorU: 30,
       pendingDC: 7,
+      pastFirstStep: true,
       spans: [{ dC: 1, dU: 1 }],
       stale: { refC: 1996 },
       ema: 1000,
@@ -717,6 +947,7 @@ describe("startNewSegment", () => {
     const next = startNewSegment(prev);
     expect(next).toEqual(
       estimator({
+        spans: [{ dC: 1, dU: 1 }],
         stale: { refC: 1996 },
         ema: 1000,
         display: 990,
@@ -731,6 +962,7 @@ describe("startNewSegment", () => {
     const prev = estimator({
       prevC: 300,
       anchorU: 30,
+      pastFirstStep: true,
       spans: [{ dC: 100, dU: 10 }],
       ema: 1000,
       display: 1000,
@@ -741,6 +973,7 @@ describe("startNewSegment", () => {
       estimator({
         prevC: 10,
         anchorU: 45,
+        spans: [{ dC: 100, dU: 10 }],
         ema: 1000,
         display: 1000,
         baseline: 1000,
