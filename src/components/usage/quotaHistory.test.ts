@@ -193,24 +193,28 @@ describe("replayTierEstimates", () => {
   });
 
   it("keeps the spans across a window reset and drops the first step after it", () => {
-    // 前三点结算 {100, 10}，得 $1000。随后 U 从 30 骤降到 2（窗口重置），新窗口的真实额度
-    // 是 $2000（U 每 +10 对应 C 每 +$200）。手算 EMA（α=0.5）：
-    //   重置点：旧段留着，max(100·100/10, 100·20/2) = 1000，EMA 1000；
-    //   2→12 是重置后第一格，丢弃：max(1000, 100·220/12 ≈ 1833.3)，EMA ≈ 1416.7；
-    //   12→22 结算 {200, 10}，裁剪后只剩它：max(2000, 1909.1)，EMA ≈ 1708.3。
-    // 重置清段的话重置点与第一格都没有段，EMA 停在 1000；第一格不丢的话第 5 点就到 1500。
+    // 20→30 结算 {100, 10}，得 $1000；30→40 结算 {300, 10}，裁剪后只剩它，段比值 3000，
+    // EMA 2000。随后 U 从 40 骤降到 2（窗口重置），新窗口 U 每 +10 对应 C 每 +$200。
+    // 手算 EMA（α=0.5），下界是 100·C/(U+1)：
+    //   重置点：旧段 {300, 10} 留着，max(3000, 100·20/3 ≈ 667)，EMA 2500；
+    //   2→12 是重置后第一格，丢弃：max(3000, 100·220/13 ≈ 1692)，EMA 2750；
+    //   12→22 结算 {200, 10}，裁剪后只剩它：max(2000, 100·420/23 ≈ 1826)，EMA 2375。
+    // 重置清段的话段不足 5pp、下界又低于估算，EMA 一直停在 2000；
+    // 第一格不丢的话第 6 点就按 2000 折入，EMA 2250。
     const { estimates: out } = replayTierEstimates([
       { u: 10, c: 100 },
       { u: 20, c: 200 },
       { u: 30, c: 300 },
+      { u: 40, c: 600 },
       { u: 2, c: 20 },
       { u: 12, c: 220 },
       { u: 22, c: 420 },
     ]);
     expect(out[2]).toBeCloseTo(1000, 6);
-    expect(out[3]).toBeCloseTo(1000, 6);
-    expect(out[4]).toBeCloseTo(1416.667, 2);
-    expect(out[5]).toBeCloseTo(1708.333, 2);
+    expect(out[3]).toBeCloseTo(2000, 6);
+    expect(out[4]).toBeCloseTo(2500, 6);
+    expect(out[5]).toBeCloseTo(2750, 6);
+    expect(out[6]).toBeCloseTo(2375, 6);
   });
 
   it("ignores intervals where the window moved without local spend", () => {
@@ -414,21 +418,24 @@ describe("rowsToSeries", () => {
   });
 
   it("carries the estimate across a gap without folding the gap's deltas", () => {
-    // 断档前 20→21 是本段第一格，丢弃；21→26 结算 {50, 5}，确立 $1000。
-    // 停机期间窗口滚过，重开后 U=45、C=$90：U 不降反升，重置判定碰不到，只有断档切段能挡住
+    // 断档前：20→21 是本段第一格，丢弃；21→26 结算 {50, 5}，得 $1000；26→31 结算 {150, 5}，
+    // 裁剪后只剩它，段比值 $3000，EMA 走一半到 $2000。断档时旧段比值（3000）≠ EMA（2000）。
+    // 停机期间窗口滚过，重开后 U=45、C=$240：U 不降反升，重置判定碰不到，只有断档切段能挡住
     // 跨断档的差值。
-    // 切段沿用：断档后第一点只开新段；45→55 是新段第一格，丢弃；两点都按旧段 {50, 5} 估，
-    //   显示 $1000。55→60 结算 {150, 5}，裁剪后只剩它，$3000，EMA 从 $1000 走一半到 $2000。
-    // 跨断档硬折：第一点结算 {20, 19}，EMA 被拉到 $600。
+    // 切段沿用：断档后第一点只开新段，按旧段 {150, 5} 折入 3000，EMA 2500；45→55 是新段
+    //   第一格，丢弃，仍按旧段折入，EMA 2750；55→60 结算 {150, 5}，EMA 2875。
+    // 断档清段：段不足 5pp，下界 100·240/46 ≈ 522 低于估算，停在 $2000。
+    // 跨断档硬折：第一点结算 {20, 14}，只剩下界 522，EMA 被拉到约 $1261。
     // 从零开始：断档后第一点是 null。
     const { rows } = rowsToSeries(
       [
         row(10, "five_hour", 20, { spendUsd: 10 }),
         row(11, "five_hour", 21, { spendUsd: 20 }),
         row(12, "five_hour", 26, { spendUsd: 70 }),
-        row(30, "five_hour", 45, { spendUsd: 90 }),
-        row(31, "five_hour", 55, { spendUsd: 390 }),
-        row(32, "five_hour", 60, { spendUsd: 540 }),
+        row(13, "five_hour", 31, { spendUsd: 220 }),
+        row(30, "five_hour", 45, { spendUsd: 240 }),
+        row(31, "five_hour", 55, { spendUsd: 540 }),
+        row(32, "five_hour", 60, { spendUsd: 690 }),
       ],
       "claude",
     );
@@ -437,16 +444,18 @@ describe("rowsToSeries", () => {
       hourStartMs(11),
       hourStartMs(12),
       hourStartMs(13),
+      hourStartMs(14),
       hourStartMs(30),
       hourStartMs(31),
       hourStartMs(32),
     ]);
     expect(rows[1].five_hour).toBeNull();
     expect(rows[2].five_hour).toBeCloseTo(1000, 6);
-    expect(rows[3].five_hour).toBeNull(); // 断线行
-    expect(rows[4].five_hour).toBeCloseTo(1000, 6);
-    expect(rows[5].five_hour).toBeCloseTo(1000, 6);
-    expect(rows[6].five_hour).toBeCloseTo(2000, 6);
+    expect(rows[3].five_hour).toBeCloseTo(2000, 6);
+    expect(rows[4].five_hour).toBeNull(); // 断线行
+    expect(rows[5].five_hour).toBeCloseTo(2500, 6);
+    expect(rows[6].five_hour).toBeCloseTo(2750, 6);
+    expect(rows[7].five_hour).toBeCloseTo(2875, 6);
   });
 
   it("skips rows that measured zero spend", () => {
@@ -469,12 +478,13 @@ describe("rowsToSeries", () => {
 
   it("keeps ignoring stale spend across a gap", () => {
     // 真实形状：重置后 U 只有 2..5，C 却残留旧窗口的累计（约 $920..$1100），
-    // 而且跨过了断档。断档后若不再忽略这些样本，C/U 会冲到上万。
+    // 而且跨过了断档。断档前段已满 5pp，断档后若不再忽略这些样本，h16 会按
+    // max(2000, 100·1050/5 = 21000) 折入，EMA 冲到上万。
     const { rows } = rowsToSeries(
       [
-        row(9, "seven_day", 79, { spendUsd: 780 }),
-        row(10, "seven_day", 80, { spendUsd: 800 }), // 本段第一格，丢弃
-        row(11, "seven_day", 81, { spendUsd: 820 }), // 结算 $20/1pp，得 $2000
+        row(9, "seven_day", 75, { spendUsd: 700 }),
+        row(10, "seven_day", 76, { spendUsd: 720 }), // 本段第一格，丢弃
+        row(11, "seven_day", 81, { spendUsd: 820 }), // 结算 {100, 5}，得 $2000
         row(12, "seven_day", 2, { spendUsd: 920 }), // 重置，C 没回落：进入 stale
         row(13, "seven_day", 3, { spendUsd: 960 }),
         row(16, "seven_day", 4, { spendUsd: 1050 }),

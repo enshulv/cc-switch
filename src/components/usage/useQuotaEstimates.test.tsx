@@ -49,6 +49,8 @@ function settings(overrides: Partial<Settings> = {}): Settings {
 const HOUR_MS = 3_600_000;
 const QUERIED_AT = 1_000;
 const ENOUGH_TOKENS_FOR_PROVISIONAL = 1_000_000_000;
+/** 实时样本 C=$50、U=10 的 provisional 引导值：累积下界 100·50/(10+1) */
+const LIVE_PROVISIONAL_USD = 5000 / 11;
 
 function modelStats(totalCost: number): ModelStats[] {
   return [
@@ -195,7 +197,7 @@ describe("useQuotaEstimates", () => {
     client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
     });
-    // 实时样本：C=$50、U=10，累积推断是 $500
+    // 实时样本：C=$50、U=10，累积下界是 100·50/11 ≈ $454.5
     getModelStats.mockResolvedValue(modelStats(50));
     getUsageSummary.mockResolvedValue(
       usageSummary(ENOUGH_TOKENS_FOR_PROVISIONAL),
@@ -235,7 +237,10 @@ describe("useQuotaEstimates", () => {
     queryHistory.mockResolvedValue([]);
     const { result } = renderEstimates("claude", liveQuota());
     await waitFor(() =>
-      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
   });
 
@@ -243,7 +248,10 @@ describe("useQuotaEstimates", () => {
     queryHistory.mockRejectedValue(new Error("db locked"));
     const { result } = renderEstimates("claude", liveQuota());
     await waitFor(() =>
-      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
   });
 
@@ -255,7 +263,7 @@ describe("useQuotaEstimates", () => {
     await waitFor(() => expect(getModelStats).toHaveBeenCalled());
     await waitFor(() => expect(getUsageSummary).toHaveBeenCalled());
     await settle();
-    // 实时样本已落地；若此时就折，会显示 provisional 的 $500，种子之后再也用不上
+    // 实时样本已落地；若此时就折，会显示 provisional 的 $454.5，种子之后再也用不上
     expect(result.current.get("five_hour")?.quotaUsd).toBeNull();
 
     await act(async () => {
@@ -344,7 +352,10 @@ describe("useQuotaEstimates", () => {
       ]),
     );
     await waitFor(() =>
-      expect(result.current.get("seven_day")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("seven_day")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
     expect(result.current.has("five_hour")).toBe(false);
     expect(getModelStats).toHaveBeenCalledTimes(1);
@@ -400,7 +411,10 @@ describe("useQuotaEstimates: scanning the session logs before measuring", () => 
       getModelStats.mock.invocationCallOrder[0],
     );
     await waitFor(() =>
-      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
   });
 
@@ -408,7 +422,10 @@ describe("useQuotaEstimates: scanning the session logs before measuring", () => 
     syncSessionUsage.mockRejectedValue(new Error("db locked"));
     const { result } = renderEstimates("claude", liveQuota());
     await waitFor(() =>
-      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
     expect(syncSessionUsage).toHaveBeenCalled();
   });
@@ -417,7 +434,10 @@ describe("useQuotaEstimates: scanning the session logs before measuring", () => 
     getSettings.mockRejectedValue(new Error("ipc down"));
     const { result } = renderEstimates("claude", liveQuota());
     await waitFor(() =>
-      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
     expect(getSettings).toHaveBeenCalled();
   });
@@ -426,7 +446,10 @@ describe("useQuotaEstimates: scanning the session logs before measuring", () => 
     getSettings.mockResolvedValue(settings({ sessionAutoSyncEnabled: false }));
     const { result } = renderEstimates("claude", liveQuota());
     await waitFor(() =>
-      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(
+        LIVE_PROVISIONAL_USD,
+        6,
+      ),
     );
     expect(getSettings).toHaveBeenCalled();
     expect(syncSessionUsage).not.toHaveBeenCalled();
