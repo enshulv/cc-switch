@@ -52,9 +52,9 @@ describe("tierModelPredicate", () => {
 });
 
 describe("cumulativeQuotaUsd (lower-bound from all local data)", () => {
-  it("reverse-computes 100·C/U", () => {
-    expect(cumulativeQuotaUsd(3, 1)).toBeCloseTo(300);
-    expect(cumulativeQuotaUsd(12, 30)).toBeCloseTo(40);
+  it("reverse-computes 100·C/(U+1), since a whole-number U hides up to one more point", () => {
+    expect(cumulativeQuotaUsd(3, 1)).toBeCloseTo(150);
+    expect(cumulativeQuotaUsd(12, 30)).toBeCloseTo(1200 / 31);
   });
   it("returns null on non-positive percentage or spend", () => {
     expect(cumulativeQuotaUsd(5, 0)).toBeNull();
@@ -441,10 +441,15 @@ describe("foldQuotaSample", () => {
     expect(foldQuotaSample(prev, 410, 10)).toEqual(
       estimator({ ...kept, prevC: 100, anchorU: 10, stale: { refC: 100 } }),
     );
-    // 100·390/10 = 3900，3.9 倍：正常重置，C 照常前推
-    expect(foldQuotaSample(prev, 390, 10)).toEqual(
-      estimator({ ...kept, prevC: 390, anchorU: 10 }),
-    );
+    // 100·390/10 = 3900，3.9 倍：正常重置，C 照常前推。段不足 5pp，但累积下界
+    // 100·390/11 ≈ 3545 高于估算，照常折入
+    const normal = foldQuotaSample(prev, 390, 10);
+    expect(normal.stale).toBeNull();
+    expect(normal.prevC).toBe(390);
+    expect(normal.anchorU).toBe(10);
+    expect(normal.spans).toEqual(kept.spans);
+    expect(normal.ema).toBeCloseTo(1000 + 0.5 * (39000 / 11 - 1000), 6);
+    expect(normal.baseline).toBe(1000);
     // 有估算值时，降幅超过 20 格也按比值判定
     const largeDrop = foldQuotaSample({ ...prev, anchorU: 50 }, 390, 10);
     expect(largeDrop.stale).toBeNull();
@@ -489,18 +494,19 @@ describe("foldQuotaSample", () => {
   });
 
   it("pools spend and points over spans of different sizes", () => {
-    // 100·(10 + 40 + 30)/(1 + 2 + 1) = 2000；逐段比值取平均会是 (1000 + 2000 + 3000)/3。
+    // 池化：100·(10 + 60 + 30)/(1 + 2 + 1) = 2500。
+    // 逐段比值取平均是 (1000 + 3000 + 3000)/3 ≈ 2333，两者不同。
     const prev = estimator({
-      prevC: 150,
+      prevC: 170,
       anchorU: 13,
       pastFirstStep: true,
       spans: [
         { dC: 10, dU: 1 },
-        { dC: 40, dU: 2 },
+        { dC: 60, dU: 2 },
       ],
     });
-    const next = foldQuotaSample(prev, 180, 14);
-    expect(next.ema).toBeCloseTo(2000, 6);
+    const next = foldQuotaSample(prev, 200, 14);
+    expect(next.ema).toBeCloseTo(2500, 6);
   });
 
   it("keeps an older span until the newer ones cover 5 percentage points", () => {
@@ -530,8 +536,8 @@ describe("foldQuotaSample", () => {
   it("floors the span ratio at the cumulative lower bound", () => {
     const prev = estimator({ prevC: 1000, anchorU: 50, pastFirstStep: true });
     const next = foldQuotaSample(prev, 1005, 51);
-    // 段比值 = 100·5/1 = 500，累积 = 100·1005/51 ≈ 1970.6
-    expect(next.ema).toBeCloseTo((1005 / 51) * 100, 6);
+    // 段比值 = 100·5/1 = 500，累积下界 = 100·1005/52 ≈ 1932.7
+    expect(next.ema).toBeCloseTo((1005 / 52) * 100, 6);
   });
 
   it("holds the shown value while the EMA moves within 2%", () => {
@@ -629,6 +635,30 @@ describe("foldQuotaSample", () => {
     expect(secondStep.ema).toBeCloseTo(1083.333, 2);
   });
 
+  it("does not let a low whole-number U after a reset push the estimate above the true quota", () => {
+    // 真实额度 $3200（$32/pp），全部用量来自本机。段已满 5pp、估算 3200。
+    // 窗口重置后 U 报 1 的期间，真实用量从 1.0pp 涨到 1.9pp：C 32 → 48 → 60.8。
+    // 100·C/U 在 C=60.8 时是 6080，高出真实额度近一倍；100·C/(U+1) = 3040 才是下界。
+    const prev = estimator({
+      prevC: 500,
+      anchorU: 40,
+      pastFirstStep: true,
+      spans: [{ dC: 160, dU: 5 }],
+      ema: 3200,
+      display: 3200,
+      baseline: 3200,
+    });
+    const states = foldEach(prev, [
+      [32, 1],
+      [48, 1],
+      [60.8, 1],
+    ]);
+    for (const state of states) {
+      expect(state.display!).toBeLessThanOrEqual(3200 + 1e-9);
+    }
+    expect(lastOf(states).display).toBeCloseTo(3200, 6);
+  });
+
   it("ignores samples while C still carries the previous window's spend", () => {
     // 真实形状：窗口重置后 U 归零，C 却还是旧窗口的累计，C/U 冲到十万级。
     const prev = estimator({
@@ -690,13 +720,15 @@ describe("foldQuotaSample", () => {
 
   it("only takes the cumulative bootstrap when provisional is allowed and nothing is estimated yet", () => {
     expect(foldQuotaSample(null, 100, 50).display).toBeNull();
+    // 累积下界 100·100/51
     const provisional = foldQuotaSample(null, 100, 50, true);
-    expect(provisional.display).toBeCloseTo(200, 6);
+    expect(provisional.display).toBeCloseTo(10000 / 51, 6);
 
-    // 已有 EMA 后不再走 provisional，等第一格
-    const again = foldQuotaSample(provisional, 120, 50, true);
-    expect(again.ema).toBeCloseTo(200, 6);
-    expect(again.display).toBeCloseTo(200, 6);
+    // 已有 EMA 后不再走 provisional：C 回落 $0.2（噪声），下界 100·99.8/51 低于估算，
+    // 估算不动。走 provisional 的话会折入这个更低的值。
+    const again = foldQuotaSample(provisional, 99.8, 50, true);
+    expect(again.ema).toBeCloseTo(10000 / 51, 6);
+    expect(again.display).toBeCloseTo(10000 / 51, 6);
   });
 
   it("skips the bootstrap when the state already carries an estimate", () => {
@@ -864,9 +896,10 @@ describe("foldQuotaSample: the first step of a segment", () => {
 
 describe("foldQuotaSample: an estimate waits for 5 points of spans", () => {
   it("holds the estimate until the kept spans cover 5 points, then folds", () => {
-    // 种子 $1000。10→11 是第一格，丢弃；之后每格 {20, 1}，第 5 段凑满 5pp：
-    // 段比值 2000，累积下界 100·210/16 ≈ 1313，EMA 走一半到 1500。
-    const states = foldEach(seededEstimator(1000), [
+    // 种子 $3000，窗口未满期间累积下界（至多 100·190/16 ≈ 1188）一直低于它。
+    // 10→11 是第一格，丢弃；之后每格 {20, 1}，第 5 段凑满 5pp：
+    // 段比值 2000，累积下界 100·210/17 ≈ 1235，EMA 走一半到 2500。
+    const states = foldEach(seededEstimator(3000), [
       [100, 10],
       [110, 11],
       [130, 12],
@@ -876,9 +909,9 @@ describe("foldQuotaSample: an estimate waits for 5 points of spans", () => {
       [210, 16],
     ]);
     for (const state of states.slice(0, 6)) {
-      expect(state.ema).toBe(1000);
-      expect(state.display).toBe(1000);
-      expect(state.baseline).toBe(1000);
+      expect(state.ema).toBe(3000);
+      expect(state.display).toBe(3000);
+      expect(state.baseline).toBe(3000);
     }
     // 估算不动时段照常推进
     expect(states.slice(1, 6).map((s) => s.spans.length)).toEqual([
@@ -889,9 +922,29 @@ describe("foldQuotaSample: an estimate waits for 5 points of spans", () => {
 
     const filled = lastOf(states);
     expect(filled.spans).toHaveLength(5);
-    expect(filled.ema).toBeCloseTo(1500, 6);
-    expect(filled.display).toBeCloseTo(1500, 6);
-    expect(filled.baseline).toBe(1000);
+    expect(filled.ema).toBeCloseTo(2500, 6);
+    expect(filled.display).toBeCloseTo(2500, 6);
+    expect(filled.baseline).toBe(3000);
+  });
+
+  it("folds the cumulative lower bound while the window fills, once it exceeds the estimate", () => {
+    // 种子 $1000，段还没有。C=300、U=10：下界 100·300/11 ≈ 2727 高于估算，照常折入，
+    // EMA 走一半到约 1864。之后 U 跳到 30（本段第一格），下界 100·320/31 ≈ 1032
+    // 低于估算，不折入。
+    const states = foldEach(seededEstimator(1000), [
+      [100, 10],
+      [300, 10],
+      [320, 30],
+    ]);
+    expect(states[0].ema).toBe(1000);
+    const raised = 1000 + 0.5 * (30000 / 11 - 1000);
+    expect(states[1].ema).toBeCloseTo(raised, 6);
+    expect(states[1].display).toBeCloseTo(raised, 6);
+    expect(states[1].baseline).toBe(1000);
+    expect(states[1].spans).toEqual([]);
+    expect(states[2].ema).toBeCloseTo(raised, 6);
+    expect(states[2].display).toBeCloseTo(raised, 6);
+    expect(states[2].baseline).toBe(1000);
   });
 
   it("estimates from fewer than 5 points of spans when there is no estimate yet", () => {
