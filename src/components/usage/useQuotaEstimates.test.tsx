@@ -4,21 +4,47 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useQuotaEstimates } from "./useQuotaEstimates";
 import { usageApi } from "@/lib/api/usage";
+import { settingsApi } from "@/lib/api/settings";
 import { quotaHistoryApi, type QuotaHistoryRow } from "@/lib/api/quotaHistory";
 import { quotaHistoryKeys } from "@/lib/query/quotaHistory";
-import type { ModelStats, UsageSummary } from "@/types/usage";
+import type { Settings } from "@/types";
+import type {
+  ModelStats,
+  SessionSyncResult,
+  UsageSummary,
+} from "@/types/usage";
 import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
 
 vi.mock("@/lib/api/usage", () => ({
-  usageApi: { getModelStats: vi.fn(), getUsageSummary: vi.fn() },
+  usageApi: {
+    getModelStats: vi.fn(),
+    getUsageSummary: vi.fn(),
+    syncSessionUsage: vi.fn(),
+  },
 }));
+vi.mock("@/lib/api/settings", () => ({ settingsApi: { get: vi.fn() } }));
 vi.mock("@/lib/api/quotaHistory", () => ({
   quotaHistoryApi: { query: vi.fn(), record: vi.fn() },
 }));
 
 const getModelStats = vi.mocked(usageApi.getModelStats);
 const getUsageSummary = vi.mocked(usageApi.getUsageSummary);
+const syncSessionUsage = vi.mocked(usageApi.syncSessionUsage);
+const getSettings = vi.mocked(settingsApi.get);
 const queryHistory = vi.mocked(quotaHistoryApi.query);
+
+const SYNC_RESULT: SessionSyncResult = {
+  imported: 0,
+  skipped: 0,
+  filesScanned: 0,
+  suspectedDuplicates: 0,
+  deferredFiles: 0,
+  errors: [],
+};
+
+function settings(overrides: Partial<Settings> = {}): Settings {
+  return { showInTray: false, minimizeToTrayOnClose: false, ...overrides };
+}
 
 const HOUR_MS = 3_600_000;
 const QUERIED_AT = 1_000;
@@ -93,27 +119,31 @@ function historyRow(
   };
 }
 
-/** 回放后 five_hour 最后一点是 $1000（10pp 花 $100） */
+/** 回放后 five_hour 最后一点是 $1000（第一格丢弃，之后 10pp 花 $100） */
 const historySeeding1000 = [
-  historyRow(3, "five_hour", 10, 100),
-  historyRow(2, "five_hour", 20, 200),
+  historyRow(4, "five_hour", 10, 100),
+  historyRow(3, "five_hour", 11, 110),
+  historyRow(2, "five_hour", 21, 210),
 ];
 
-/** 回放后 five_hour 最后一点是 $2000（1pp 花 $20） */
+/** 回放后 five_hour 最后一点是 $2000（第一格丢弃，之后 1pp 花 $20） */
 const historySeeding2000 = [
-  historyRow(3, "five_hour", 10, 100),
-  historyRow(2, "five_hour", 11, 120),
+  historyRow(4, "five_hour", 10, 100),
+  historyRow(3, "five_hour", 11, 120),
+  historyRow(2, "five_hour", 12, 140),
 ];
 
-/** 回放后 five_hour 是 $1000，seven_day 是 $3000（1pp 花 $30） */
+/** 回放后 five_hour 是 $1000，seven_day 是 $3000（第一格丢弃，之后 1pp 花 $30） */
 const historySeedingBothWindows = [
   ...historySeeding1000,
-  historyRow(3, "seven_day", 10, 100),
-  historyRow(2, "seven_day", 11, 130),
+  historyRow(4, "seven_day", 10, 100),
+  historyRow(3, "seven_day", 11, 130),
+  historyRow(2, "seven_day", 12, 160),
 ];
 
-/** 下一份快照与首份相隔 5 分钟 */
+/** 之后两份快照与首份各相隔 5 分钟、10 分钟 */
 const NEXT_QUERIED_AT = QUERIED_AT + 300_000;
+const THIRD_QUERIED_AT = QUERIED_AT + 600_000;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -170,6 +200,8 @@ describe("useQuotaEstimates", () => {
     getUsageSummary.mockResolvedValue(
       usageSummary(ENOUGH_TOKENS_FOR_PROVISIONAL),
     );
+    getSettings.mockResolvedValue(settings());
+    syncSessionUsage.mockResolvedValue(SYNC_RESULT);
   });
 
   afterEach(() => {
@@ -248,10 +280,16 @@ describe("useQuotaEstimates", () => {
     });
     await waitFor(() => expect(queryHistory).toHaveBeenCalledTimes(2));
 
-    // 下一份快照：C $50→$70、U 10→11。从记录往前折结算 {20, 1}，即 $2000，
-    // EMA 从 $1000 走一半到 $1500。重新播种的话，这一样本只开段，停在种子 $1000 或 $2000。
+    // 之后两份快照：U 10→11 是本段第一格，丢弃；U 11→16、C $70→$170 结算 {100, 5}，
+    // 段比值 $2000，EMA 从 $1000 走一半到 $1500。
+    // 重新播种的话，每个样本都只开段，停在种子 $1000 或 $2000。
     getModelStats.mockResolvedValue(modelStats(70));
     rerender({ current: liveQuota(11, NEXT_QUERIED_AT) });
+    await settle();
+    expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1000, 6);
+
+    getModelStats.mockResolvedValue(modelStats(170));
+    rerender({ current: liveQuota(16, THIRD_QUERIED_AT) });
     await waitFor(() =>
       expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1500, 6),
     );
@@ -281,10 +319,16 @@ describe("useQuotaEstimates", () => {
     });
     await settle();
 
-    // 下一份快照 C=$70、U=11：从 $50、10% 起算结算 {20, 1}，EMA 到 $1500。
-    // 若上一步被种子记录挡掉，这一样本只开段，停在 $1000。
+    // 之后两份快照：从 $50、10% 起算，U 10→11 是本段第一格，丢弃；
+    // U 11→16、C $70→$170 结算 {100, 5}，EMA 到 $1500。
+    // 若上一步被种子记录挡掉，U=11 才开段，U 11→16 成了第一格被丢弃，停在 $1000。
     getModelStats.mockResolvedValue(modelStats(70));
     rerender({ current: liveQuota(11, NEXT_QUERIED_AT) });
+    await settle();
+    expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1000, 6);
+
+    getModelStats.mockResolvedValue(modelStats(170));
+    rerender({ current: liveQuota(16, THIRD_QUERIED_AT) });
     await waitFor(() =>
       expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(1500, 6),
     );
@@ -312,5 +356,79 @@ describe("useQuotaEstimates", () => {
     await settle();
     expect(queryHistory).not.toHaveBeenCalled();
     expect(result.current.size).toBe(0);
+  });
+});
+
+describe("useQuotaEstimates: scanning the session logs before measuring", () => {
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    getModelStats.mockResolvedValue(modelStats(50));
+    getUsageSummary.mockResolvedValue(
+      usageSummary(ENOUGH_TOKENS_FOR_PROVISIONAL),
+    );
+    getSettings.mockResolvedValue(settings());
+    syncSessionUsage.mockResolvedValue(SYNC_RESULT);
+    queryHistory.mockResolvedValue([]);
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    client.clear();
+    vi.clearAllMocks();
+    warn.mockRestore();
+  });
+
+  it("measures no window until the scan finishes, and scans once for all windows", async () => {
+    const scan = deferred<SessionSyncResult>();
+    syncSessionUsage.mockReturnValueOnce(scan.promise);
+    const { result } = renderEstimates("claude", liveQuota());
+
+    await waitFor(() => expect(syncSessionUsage).toHaveBeenCalledTimes(1));
+    await settle();
+    expect(getModelStats).not.toHaveBeenCalled();
+
+    await act(async () => {
+      scan.resolve(SYNC_RESULT);
+    });
+    await waitFor(() => expect(getModelStats).toHaveBeenCalledTimes(2));
+    expect(syncSessionUsage).toHaveBeenCalledTimes(1);
+    expect(syncSessionUsage.mock.invocationCallOrder[0]).toBeLessThan(
+      getModelStats.mock.invocationCallOrder[0],
+    );
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+    );
+  });
+
+  it("still measures when the scan fails", async () => {
+    syncSessionUsage.mockRejectedValue(new Error("db locked"));
+    const { result } = renderEstimates("claude", liveQuota());
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+    );
+    expect(syncSessionUsage).toHaveBeenCalled();
+  });
+
+  it("still measures when the settings cannot be read", async () => {
+    getSettings.mockRejectedValue(new Error("ipc down"));
+    const { result } = renderEstimates("claude", liveQuota());
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+    );
+    expect(getSettings).toHaveBeenCalled();
+  });
+
+  it("measures without scanning when auto sync is off", async () => {
+    getSettings.mockResolvedValue(settings({ sessionAutoSyncEnabled: false }));
+    const { result } = renderEstimates("claude", liveQuota());
+    await waitFor(() =>
+      expect(result.current.get("five_hour")?.quotaUsd).toBeCloseTo(500, 6),
+    );
+    expect(getSettings).toHaveBeenCalled();
+    expect(syncSessionUsage).not.toHaveBeenCalled();
   });
 });
