@@ -14,17 +14,23 @@
  *
  * The estimator therefore works in SPANS: local spend accumulates while U sits
  * still, and each time U steps up the accumulated spend is settled together
- * with the size of the step. The estimate is a recency-weighted slope over the
- * last few percentage points of spans (`RECENCY_HALF_LIFE_PP`), so it follows
- * the current usage mix quickly and corrects itself as more steps arrive.
- * Spans driven by other machines read low; they are kept as-is. The cumulative
- * ratio `100·C/U` acts as a floor (all local data is a lower bound the true
- * quota can't fall below).
+ * with the size of the step. The estimate is the pooled ratio
+ * `100·ΣdC/ΣdU` over the newest spans that cover `SPAN_KEEP_PP` percentage
+ * points, every kept span weighted equally, so one mis-cut span cannot swing
+ * the figure. Spans driven by other machines read low; they are kept as-is.
+ * The cumulative ratio `100·C/U` acts as a floor (all local data is a lower
+ * bound the true quota can't fall below).
  *
- * Q is an account-level dollar figure, independent of any one window, so the
- * estimate survives window resets and recording gaps; only the span state is
- * cleared. `foldQuotaSample` detects resets itself; a recording gap is marked
- * by the caller with `startNewSegment`.
+ * A segment is a run of samples that can be compared with each other. The
+ * first step of every segment settles no span: the anchor's position inside its
+ * whole-number U is unknown, so that step covers less than its dU and would
+ * read low.
+ *
+ * Q is an account-level dollar figure, independent of any one window, and each
+ * span was measured inside a single window, so the spans and the estimate
+ * survive window resets and recording gaps; only the segment is restarted.
+ * `foldQuotaSample` detects resets itself; a recording gap is marked by the
+ * caller with `startNewSegment`.
  *
  * The live hook (`useQuotaEstimates`) streams refreshes through
  * `foldQuotaSample`, and `quotaHistory.replayTierEstimates` replays the hourly
@@ -43,17 +49,18 @@ const DAY_MS = 86_400_000;
  * is deliberately biased toward **converging fast**, accepting jumpier
  * readings that later samples correct. Each knob can be adjusted in isolation:
  *
- * - RECENCY_HALF_LIFE_PP — a span's weight halves for every this-many
- *   percentage points of newer spans. At 1.5 the last 1–2 points dominate the
- *   estimate.
- * - SPAN_KEEP_PP / MAX_SPANS — how much span history is kept. At 10 points of
- *   age a span weighs about 1%, so older spans cannot move the estimate
- *   visibly.
+ * - SPAN_KEEP_PP / MAX_SPANS — the estimation window. The oldest span is
+ *   dropped while the newer spans still cover SPAN_KEEP_PP points, and at most
+ *   MAX_SPANS spans are kept. Local spend reaches the database only when the
+ *   session logs are scanned, so each span's dC is cut at scan time rather than
+ *   at the step of U; pooling 5 points averages that cut error out. Once the
+ *   state carries an estimate, it is only updated while the kept spans cover
+ *   SPAN_KEEP_PP points.
  * - JITTER_PP / RESET_C_DROP_USD — window-reset detection. U falling by more
  *   than JITTER_PP points, or C falling by more than RESET_C_DROP_USD dollars,
- *   is a reset: the spans are cleared, the estimate is kept. C only grows
- *   within a window, so smaller falls of C are measurement noise; a one-point
- *   fall of U is provider jitter.
+ *   is a reset: a new segment starts, the spans and estimate are kept. C only
+ *   grows within a window, so smaller falls of C are measurement noise; a
+ *   one-point fall of U is provider jitter.
  * - STALE_RATIO / RESET_DROP_PCT — when C did not fall at a reset, it may still
  *   count the previous window. Correctly measured C keeps 100·C/U ≤ Q, and a
  *   whole-number U at most doubles that ratio (U=1 may really be 1.99), while
@@ -76,8 +83,7 @@ const DAY_MS = 86_400_000;
  *   immediately instead of hiding. The one decision is shared across all tiers
  *   so 5h and 7d light up together.
  */
-export const RECENCY_HALF_LIFE_PP = 1.5;
-const SPAN_KEEP_PP = 10;
+const SPAN_KEEP_PP = 5;
 const MAX_SPANS = 64;
 const JITTER_PP = 1;
 const RESET_C_DROP_USD = 0.5;
@@ -227,7 +233,12 @@ export interface EstimatorState {
   anchorU: number | null;
   /** Local spend since the last step of U, not yet settled into a span. */
   pendingDC: number;
-  /** Settled spans, oldest first. */
+  /**
+   * Whether U has stepped since this segment's anchor was set. The first step
+   * settles no span.
+   */
+  pastFirstStep: boolean;
+  /** Settled spans, oldest first; kept across segments. */
   spans: QuotaSpan[];
   /**
    * Non-null while C still carries the previous window's spend after a reset;
@@ -243,9 +254,9 @@ export interface EstimatorState {
 }
 
 /**
- * Copy of `prev` with the segment cleared and the estimate and stale marker
- * kept, for samples that cannot be compared with the previous one (a recording
- * gap). Null stays null.
+ * Copy of `prev` with the segment cleared and the spans, estimate and stale
+ * marker kept, for samples that cannot be compared with the previous one (a
+ * recording gap). Null stays null.
  */
 export function startNewSegment(
   prev: EstimatorState | null,
@@ -254,7 +265,13 @@ export function startNewSegment(
   // The history can hold rows measured from an expired window start; their C
   // keeps counting the previous window for days, across gaps. Dropping the
   // stale marker at a gap would turn those rows into C/U spikes.
-  return { ...prev, prevC: null, anchorU: null, pendingDC: 0, spans: [] };
+  return {
+    ...prev,
+    prevC: null,
+    anchorU: null,
+    pendingDC: 0,
+    pastFirstStep: false,
+  };
 }
 
 /** A state with no segment yet whose estimate starts at `seed`. */
@@ -263,6 +280,7 @@ export function seededEstimator(seed: number): EstimatorState {
     prevC: null,
     anchorU: null,
     pendingDC: 0,
+    pastFirstStep: false,
     spans: [],
     stale: null,
     ema: seed,
@@ -293,23 +311,19 @@ function carriesPreviousWindow(
   return (100 * costUsd) / utilization > STALE_RATIO * ema;
 }
 
-/** 100 · Σ(w·dC) ÷ Σ(w·dU), each span weighted by the points of newer spans. */
-function recencyWeightedQuotaUsd(spans: readonly QuotaSpan[]): number {
-  let weightedDC = 0;
-  let weightedDU = 0;
-  let age = 0;
-  for (let i = spans.length - 1; i >= 0; i--) {
-    const weight = 0.5 ** (age / RECENCY_HALF_LIFE_PP);
-    weightedDC += weight * spans[i].dC;
-    weightedDU += weight * spans[i].dU;
-    age += spans[i].dU;
-  }
-  return (100 * weightedDC) / weightedDU;
+function coveredPoints(spans: readonly QuotaSpan[]): number {
+  return spans.reduce((acc, s) => acc + s.dU, 0);
+}
+
+/** 100 · ΣdC ÷ ΣdU over every span. */
+function pooledQuotaUsd(spans: readonly QuotaSpan[]): number {
+  const spend = spans.reduce((acc, s) => acc + s.dC, 0);
+  return (100 * spend) / coveredPoints(spans);
 }
 
 /** Drop the oldest spans while the rest still cover SPAN_KEEP_PP; cap at MAX_SPANS. */
 function trimSpans(spans: QuotaSpan[]): QuotaSpan[] {
-  let total = spans.reduce((acc, s) => acc + s.dU, 0);
+  let total = coveredPoints(spans);
   let first = 0;
   while (
     first < spans.length &&
@@ -346,10 +360,18 @@ function instantEstimate(
 ): number | null {
   const cumulative = cumulativeQuotaUsd(costUsd, utilization);
   if (spans.length > 0) {
-    const recent = recencyWeightedQuotaUsd(spans);
-    return cumulative == null ? recent : Math.max(recent, cumulative);
+    const pooled = pooledQuotaUsd(spans);
+    return cumulative == null ? pooled : Math.max(pooled, cumulative);
   }
   return provisionalOK ? cumulative : null;
+}
+
+/** An existing estimate only moves once the kept spans fill the window. */
+function shouldFoldEstimate(
+  estimate: EstimateFields,
+  spans: readonly QuotaSpan[],
+): boolean {
+  return estimate.ema == null || coveredPoints(spans) >= SPAN_KEEP_PP;
 }
 
 /**
@@ -381,7 +403,7 @@ export function foldQuotaSample(
       prevC: costUsd,
       anchorU: utilization,
       pendingDC: 0,
-      spans: [],
+      pastFirstStep: false,
       stale: null,
     };
   }
@@ -392,15 +414,14 @@ export function foldQuotaSample(
     baseline: prev?.baseline ?? null,
   };
   let anchorU = utilization;
-  let pendingDC = prev?.pendingDC ?? 0;
+  let pendingDC = 0;
+  let pastFirstStep = false;
   let spans = prev?.spans ?? [];
 
   if (prev?.prevC != null && prev.anchorU != null) {
     const dU = utilization - prev.anchorU;
     const dC = costUsd - prev.prevC;
     if (isWindowReset(dU, dC)) {
-      spans = [];
-      pendingDC = 0;
       if (carriesPreviousWindow(estimate.ema, dU, dC, costUsd, utilization)) {
         // C/U would be wildly inflated; hold everything until C is measured
         // against the new window.
@@ -409,6 +430,7 @@ export function foldQuotaSample(
           prevC: prev.prevC,
           anchorU,
           pendingDC,
+          pastFirstStep,
           spans,
           stale: { refC: prev.prevC },
         };
@@ -416,30 +438,36 @@ export function foldQuotaSample(
     } else if (dU <= 0) {
       // U has not stepped. A jitter drop must not lower the anchor, or
       // 52 → 51 → 52 would count as a step; a noise drop of C is not spend.
-      pendingDC += Math.max(dC, 0);
+      pendingDC = prev.pendingDC + Math.max(dC, 0);
       anchorU = prev.anchorU;
+      pastFirstStep = prev.pastFirstStep;
     } else {
-      const settled = pendingDC + Math.max(dC, 0);
-      pendingDC = 0;
+      pastFirstStep = true;
+      const settled = prev.pendingDC + Math.max(dC, 0);
       // A step with no local spend is other machines' usage: move the anchor
       // past it without a span.
-      if (settled > 0) spans = [...spans, { dC: settled, dU }];
+      if (prev.pastFirstStep && settled > 0) {
+        spans = [...spans, { dC: settled, dU }];
+      }
     }
   }
 
   spans = trimSpans(spans);
-  const instant = instantEstimate(
-    spans,
-    costUsd,
-    utilization,
-    allowProvisional && estimate.ema == null,
-  );
+  const instant = shouldFoldEstimate(estimate, spans)
+    ? instantEstimate(
+        spans,
+        costUsd,
+        utilization,
+        allowProvisional && estimate.ema == null,
+      )
+    : null;
 
   return {
     ...foldInstant(estimate, instant),
     prevC: costUsd,
     anchorU,
     pendingDC,
+    pastFirstStep,
     spans,
     stale: null,
   };

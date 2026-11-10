@@ -37,6 +37,7 @@ import {
   sumTierCost,
   tierWindowStartSec,
 } from "@/components/usage/quotaEstimate";
+import { ensureFreshSessionUsage } from "@/components/usage/freshSessionUsage";
 
 /** Apps `get_subscription_quota` supports (mirrors `useSubscriptionQuota`). */
 export const PROBE_APPS = [
@@ -54,6 +55,7 @@ export const PROBE_INTERVAL_MS = 60 * 60 * 1000;
  * 和页脚实时估算量的是同一段区间、同一批模型，否则两边的数会对不上。只有 Claude / Codex
  * 能反推额度（`isEstimableApp`），其余应用返回空表、`spendUsd` 落 null，图上就没有曲线。
  * `getModelStats` 读的是本地库，一次调用很便宜；每个窗口一次，每小时一轮。
+ * 量之前先扫一次会话日志（`ensureFreshSessionUsage`），本机花费才跟得上实时的百分比。
  */
 async function measureTierSpend(
   appId: string,
@@ -61,6 +63,7 @@ async function measureTierSpend(
 ): Promise<TierSpendMap> {
   if (!isEstimableApp(appId) || !quota?.success) return {};
 
+  await ensureFreshSessionUsage();
   const spend: TierSpendMap = {};
   const end = Math.floor(Date.now() / 1000);
   for (const tier of quota.tiers ?? []) {
