@@ -171,6 +171,23 @@ describe("useQuotaHistoryProbe: scanning the session logs before measuring", () 
     expect(getModelStats).not.toHaveBeenCalled();
   });
 
+  it("does not scan when an estimable app's quota reading failed", async () => {
+    // 凭据失效、额度接口报错的读数带 queriedAt，会走进测量；这时不该扫
+    getQuota.mockImplementation(async (tool) => ({
+      ...quotaReading(tool),
+      success: false,
+      error: "token expired",
+    }));
+    renderProbe(ONLY_CLAUDE);
+    await waitFor(() => expect(getQuota).toHaveBeenCalledWith("claude"));
+    await settle();
+    await settle();
+    expect(syncSessionUsage).not.toHaveBeenCalled();
+    expect(getSettings).not.toHaveBeenCalled();
+    expect(getModelStats).not.toHaveBeenCalled();
+    expect(recordHistory).not.toHaveBeenCalled();
+  });
+
   it("still measures when the scan fails", async () => {
     syncSessionUsage.mockRejectedValue(new Error("db locked"));
     renderProbe(ONLY_CLAUDE);
