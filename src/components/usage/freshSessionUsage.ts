@@ -9,6 +9,13 @@
 import { settingsApi } from "@/lib/api/settings";
 import { usageApi } from "@/lib/api/usage";
 
+/**
+ * Longest a caller waits for the scan. The backend serializes scans behind one
+ * lock, so a stuck scan (an unresponsive network drive, say) would otherwise
+ * stall every measurement indefinitely.
+ */
+const SCAN_WAIT_LIMIT_MS = 30_000;
+
 let inFlight: Promise<void> | null = null;
 
 /**
@@ -16,15 +23,32 @@ let inFlight: Promise<void> | null = null;
  * session auto sync off (`sessionAutoSyncEnabled === false`; absent means on).
  *
  * Calls made while a scan is in flight share it; the next call after it
- * settles starts a new one. Always resolves: a failure to read the settings or
- * to scan is logged with `console.warn`, and the caller measures whatever the
- * database already holds.
+ * settles starts a new one. Always resolves, at the latest 30 seconds after
+ * the call, even when the scan is still running or has failed; the caller then
+ * measures whatever the database holds.
  */
 export function ensureFreshSessionUsage(): Promise<void> {
+  // Cleared only when the scan itself ends, so a scan that outlives the wait
+  // limit is still shared instead of being started again behind it.
   inFlight ??= syncUnlessAutoSyncOff().finally(() => {
     inFlight = null;
   });
-  return inFlight;
+  return waitAtMost(inFlight, SCAN_WAIT_LIMIT_MS);
+}
+
+function waitAtMost(scan: Promise<void>, limitMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      console.warn(
+        `[freshSessionUsage] session log scan still running after ${limitMs} ms; measuring without it`,
+      );
+      resolve();
+    }, limitMs);
+    void scan.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 async function syncUnlessAutoSyncOff(): Promise<void> {
@@ -39,7 +63,13 @@ async function syncUnlessAutoSyncOff(): Promise<void> {
   if (!autoSyncEnabled) return;
 
   try {
-    await usageApi.syncSessionUsage();
+    const result = await usageApi.syncSessionUsage();
+    if (result.errors.length > 0) {
+      console.warn(
+        "[freshSessionUsage] session log scan reported errors",
+        result.errors,
+      );
+    }
   } catch (error) {
     console.warn("[freshSessionUsage] failed to scan session logs", error);
   }

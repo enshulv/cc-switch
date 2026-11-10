@@ -100,6 +100,20 @@ describe("ensureFreshSessionUsage", () => {
     expect(syncSessionUsage).toHaveBeenCalledTimes(2);
   });
 
+  it("warns when the scan reports errors", async () => {
+    syncSessionUsage.mockResolvedValueOnce({
+      ...SYNC_RESULT,
+      errors: ["~/.codex/sessions/a.jsonl: permission denied"],
+    });
+    await ensureFreshSessionUsage();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not warn after a clean scan", async () => {
+    await ensureFreshSessionUsage();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("resolves and warns without scanning when the settings cannot be read", async () => {
     getSettings.mockRejectedValueOnce(new Error("ipc down"));
     await expect(ensureFreshSessionUsage()).resolves.toBeUndefined();
@@ -108,5 +122,69 @@ describe("ensureFreshSessionUsage", () => {
 
     await ensureFreshSessionUsage();
     expect(syncSessionUsage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ensureFreshSessionUsage with a scan that does not finish", () => {
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    getSettings.mockResolvedValue(settings());
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    warn.mockRestore();
+  });
+
+  /** 记录 promise 是否已结算 */
+  function track(promise: Promise<void>) {
+    const state = { settled: false };
+    void promise.then(() => {
+      state.settled = true;
+    });
+    return state;
+  }
+
+  it("resolves 30 seconds after the call and keeps sharing the hung scan", async () => {
+    const hung = deferred<SessionSyncResult>();
+    syncSessionUsage.mockReturnValueOnce(hung.promise);
+
+    const first = track(ensureFreshSessionUsage());
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(first.settled).toBe(false);
+    expect(syncSessionUsage).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(first.settled).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // 扫描还挂着：新调用共用它，不另起扫描，自己的 30 秒从调用时起算
+    const second = track(ensureFreshSessionUsage());
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(second.settled).toBe(false);
+    expect(syncSessionUsage).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(second.settled).toBe(true);
+
+    // 挂住的扫描结束后，下一次调用发起新扫描
+    hung.resolve(SYNC_RESULT);
+    await vi.advanceTimersByTimeAsync(0);
+    syncSessionUsage.mockResolvedValueOnce(SYNC_RESULT);
+    const third = track(ensureFreshSessionUsage());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(syncSessionUsage).toHaveBeenCalledTimes(2);
+    expect(third.settled).toBe(true);
+  });
+
+  it("resolves as soon as a quick scan finishes, without waiting out the limit", async () => {
+    syncSessionUsage.mockResolvedValueOnce(SYNC_RESULT);
+    const call = track(ensureFreshSessionUsage());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(call.settled).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
