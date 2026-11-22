@@ -120,6 +120,13 @@ impl Database {
                         .map_err(|e| AppError::Database(format!("解析定价数据失败: {e}")))
                 })
                 .transpose()
+                .map(|pricing| {
+                    pricing.map(|p| {
+                        crate::services::usage_stats::fork_long_prompt::attach_long_prompt_tier(
+                            &conn, model, p,
+                        )
+                    })
+                })
         })
     }
 }
