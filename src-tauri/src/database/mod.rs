@@ -277,6 +277,10 @@ impl Database {
         if let Err(e) = crate::services::model_pricing::sync_local_model_pricing(&db) {
             log::warn!("Failed to sync local model pricing file: {e}");
         }
+        // fork 专用：按 Haiku 5.5 分档规则修正既有明细的成本，标记缺失时执行一次。
+        if let Err(e) = db.backfill_haiku55_long_prompt_once() {
+            log::warn!("Failed to backfill Haiku 5.5 long-prompt tier costs: {e}");
+        }
 
         // Log rollup/pruning and vacuum run in periodic_backup_if_needed after
         // startup recovery, on a blocking worker. Doing them here holds up the

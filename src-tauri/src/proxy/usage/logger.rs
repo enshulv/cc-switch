@@ -872,4 +872,53 @@ mod tests {
         assert_eq!(semantics, INPUT_TOKEN_SEMANTICS_TOTAL);
         Ok(())
     }
+
+    #[test]
+    fn proxy_logging_prices_haiku_55_long_prompt_at_five_times() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT OR REPLACE INTO model_pricing (
+                    model_id, display_name, input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million
+                 ) VALUES ('claude-haiku-5-5', 'Claude Haiku 5.5', '0.10', '0.50', '0.01', '0.125')",
+                [],
+            )?;
+        }
+        let logger = UsageLogger::new(&db);
+        logger.log_with_calculation(
+            "haiku-long".into(),
+            "provider".into(),
+            rust_decimal::Decimal::ONE,
+            "claude".into(),
+            "claude-haiku-5-5".into(),
+            "claude-haiku-5-5".into(),
+            "claude-haiku-5-5".into(),
+            TokenUsage {
+                input_tokens: 100_001,
+                output_tokens: 1_000,
+                ..Default::default()
+            },
+            1,
+            None,
+            200,
+            None,
+            None,
+            false,
+        )?;
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let total: String = conn.query_row(
+            "SELECT total_cost_usd FROM proxy_request_logs WHERE request_id = 'haiku-long'",
+            [],
+            |row| row.get(0),
+        )?;
+        // 100_001 × 0.10 × 5 / 1M + 1_000 × 0.50 × 5 / 1M
+        assert_eq!(
+            total.parse::<rust_decimal::Decimal>().unwrap(),
+            rust_decimal::Decimal::new(525005, 7)
+        );
+        Ok(())
+    }
 }

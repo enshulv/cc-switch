@@ -2722,4 +2722,51 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
         Ok(())
     }
+
+    #[test]
+    fn claude_session_import_prices_haiku_55_long_prompt_at_five_times() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let conn = lock_conn!(db.conn);
+        conn.execute(
+            "INSERT OR REPLACE INTO model_pricing (
+                model_id, display_name, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+             ) VALUES ('claude-haiku-5-5', 'Claude Haiku 5.5', '0.10', '0.50', '0.01', '0.125'),
+                      ('claude-opus-5-5', 'Claude Opus 5.5', '4', '20', '0.20', '5')",
+            [],
+        )?;
+        let tx = conn.unchecked_transaction()?;
+        let mut cache = SessionPricingCache::default();
+
+        let mut import = |request_id: &str, model: &str, input_tokens: u32, output_tokens: u32| {
+            let mut msg = pricing_test_message(model);
+            msg.input_tokens = input_tokens;
+            msg.output_tokens = output_tokens;
+            msg.cache_read_tokens = 0;
+            msg.cache_creation_tokens = 0;
+            msg.cache_creation_1h_tokens = 0;
+            upsert_session_log_entry_on_conn(&tx, request_id, &msg, None, &mut cache)
+        };
+        import("session:haiku-long", "claude-haiku-5-5", 100_001, 1_000)?;
+        import("session:haiku-standard", "claude-haiku-5-5", 100_000, 0)?;
+        import("session:opus-long", "claude-opus-5-5", 100_001, 0)?;
+
+        let total_of = |request_id: &str| -> Decimal {
+            let total: String = tx
+                .query_row(
+                    "SELECT total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+                    [request_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            total.parse::<Decimal>().unwrap()
+        };
+        // 100_001 × 0.10 × 5 / 1M + 1_000 × 0.50 × 5 / 1M
+        assert_eq!(total_of("session:haiku-long"), Decimal::new(525005, 7));
+        assert_eq!(total_of("session:haiku-standard"), Decimal::new(1, 2));
+        // 其他模型超过门槛时仍是标准价：100_001 × 4 / 1M
+        assert_eq!(total_of("session:opus-long"), Decimal::new(400004, 6));
+        tx.commit()?;
+        Ok(())
+    }
 }

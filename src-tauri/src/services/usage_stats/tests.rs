@@ -5049,3 +5049,126 @@ fn pricing_snapshot_matches_sql_and_refreshes_after_mutations() -> Result<(), Ap
     );
     Ok(())
 }
+
+#[test]
+fn haiku_55_hit_row_decides_tier_for_alias_spellings() -> Result<(), AppError> {
+    let db = Database::memory()?;
+    let conn = lock_conn!(db.conn);
+    for model in [
+        "claude-haiku-5-5",
+        "claude-haiku-5-5-20261007",
+        "anthropic/claude-haiku-5.5",
+    ] {
+        let pricing = find_model_pricing(&conn, model).expect(model);
+        assert_eq!(
+            pricing.pricing_row_model_id.as_deref(),
+            Some("claude-haiku-5-5"),
+            "{model}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rows_hit_by_other_names_do_not_take_the_haiku_55_tier() -> Result<(), AppError> {
+    use crate::proxy::usage::calculator::CostCalculator;
+    use crate::proxy::usage::parser::TokenUsage;
+
+    let db = Database::memory()?;
+    let conn = lock_conn!(db.conn);
+    conn.execute(
+        "INSERT INTO model_pricing (model_id, display_name, input_cost_per_million, output_cost_per_million)
+         VALUES ('claude-haiku-5-5-20261007', 'custom', '1', '2')",
+        [],
+    )?;
+    let usage = TokenUsage {
+        input_tokens: 200_000,
+        ..Default::default()
+    };
+    for (model, expected_row) in [
+        ("claude-haiku-5-5-20261007", "claude-haiku-5-5-20261007"),
+        ("anthropic/claude-haiku-4.5", "claude-haiku-4-5-20251001"),
+    ] {
+        let pricing = find_model_pricing(&conn, model).expect(model);
+        assert_eq!(
+            pricing.pricing_row_model_id.as_deref(),
+            Some(expected_row),
+            "{model}"
+        );
+        let cost = CostCalculator::calculate_for_app(
+            "claude",
+            &usage,
+            &pricing,
+            rust_decimal::Decimal::ONE,
+        );
+        assert_eq!(
+            cost.input_cost,
+            rust_decimal::Decimal::from(200_000) * pricing.input_cost_per_million
+                / rust_decimal::Decimal::from(1_000_000),
+            "{model}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn zero_cost_backfill_applies_haiku_55_long_prompt_tier() -> Result<(), AppError> {
+    let db = Database::memory()?;
+    {
+        let conn = lock_conn!(db.conn);
+        insert_usage_log(
+            &conn,
+            "haiku-long",
+            "claude",
+            "_session",
+            "claude-haiku-5-5",
+            "session_log",
+            1000,
+            100_001,
+            1000,
+            0,
+            0,
+            200,
+            "0",
+        )?;
+        insert_usage_log(
+            &conn,
+            "haiku-standard",
+            "claude",
+            "_session",
+            "claude-haiku-5-5",
+            "session_log",
+            1000,
+            100_000,
+            0,
+            0,
+            0,
+            200,
+            "0",
+        )?;
+    }
+
+    assert_eq!(db.backfill_missing_usage_costs()?, 2);
+
+    let conn = lock_conn!(db.conn);
+    let total_of = |request_id: &str| -> rust_decimal::Decimal {
+        let total: String = conn
+            .query_row(
+                "SELECT total_cost_usd FROM proxy_request_logs WHERE request_id = ?1",
+                [request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        total.parse().unwrap()
+    };
+    // 100_001 × 0.10 × 5 / 1M + 1_000 × 0.50 × 5 / 1M
+    assert_eq!(
+        total_of("haiku-long"),
+        rust_decimal::Decimal::from_str("0.0525005").unwrap()
+    );
+    assert_eq!(
+        total_of("haiku-standard"),
+        rust_decimal::Decimal::from_str("0.01").unwrap()
+    );
+    Ok(())
+}

@@ -114,11 +114,19 @@ impl Database {
     ) -> Result<Option<ModelPricing>, AppError> {
         self.read_cache.pricing.get_or_load(model, || {
             let conn = super::lock_conn!(self.conn);
-            crate::services::usage_stats::find_model_pricing_row(&conn, model)?
-                .map(|(input, output, cache_read, cache_creation)| {
-                    ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation)
+            crate::services::usage_stats::find_model_pricing_row_with_id(&conn, model)?
+                .map(
+                    |(input, output, cache_read, cache_creation, row_model_id)| {
+                        ModelPricing::from_row(
+                            &row_model_id,
+                            &input,
+                            &output,
+                            &cache_read,
+                            &cache_creation,
+                        )
                         .map_err(|e| AppError::Database(format!("解析定价数据失败: {e}")))
-                })
+                    },
+                )
                 .transpose()
         })
     }

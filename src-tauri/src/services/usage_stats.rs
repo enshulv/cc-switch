@@ -5,6 +5,7 @@
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::proxy::usage::calculator::ModelPricing;
+use crate::proxy::usage::long_prompt_tier;
 use crate::services::sql_helpers::{
     fresh_input_sql, real_total_tokens_sql, INPUT_TOKEN_SEMANTICS_FRESH,
     INPUT_TOKEN_SEMANTICS_LEGACY, INPUT_TOKEN_SEMANTICS_TOTAL,
@@ -635,10 +636,9 @@ fn statistics_model_with(conn: &impl PricingLookup, model: &str) -> Result<Strin
     if targets.is_empty() {
         return Ok(model.to_string());
     }
-    let parse = |row: (String, String, String, String)| {
-        ModelPricing::from_strings(&row.0, &row.1, &row.2, &row.3).ok()
-    };
-    let Some(pricing) = lookup_model_pricing(conn, model)?.and_then(parse) else {
+    let parse =
+        |row: MatchedPricingRow| ModelPricing::from_strings(&row.0, &row.1, &row.2, &row.3).ok();
+    let Some(pricing) = lookup_model_pricing_with_id(conn, model)?.and_then(parse) else {
         return Ok(model.to_string());
     };
     for target in targets {
@@ -2265,12 +2265,40 @@ impl Database {
     }
 }
 
+/// 历史行的 billable 输入 token 数，按行自己的 app_type 与 input_token_semantics 还原（不含缓存部分）。
+fn historical_billable_input_tokens(log: &RequestLogDetail) -> u64 {
+    let cache_inclusive_app =
+        crate::services::sql_helpers::is_cache_inclusive_app(log.app_type.as_str());
+    if !cache_inclusive_app || log.input_token_semantics == INPUT_TOKEN_SEMANTICS_FRESH {
+        log.input_tokens as u64
+    } else if log.input_token_semantics == INPUT_TOKEN_SEMANTICS_TOTAL {
+        (log.input_tokens as u64)
+            .saturating_sub(log.cache_read_tokens as u64)
+            .saturating_sub(log.cache_creation_tokens as u64)
+    } else {
+        // v12 and earlier: input included cache reads but excluded cache writes.
+        (log.input_tokens as u64).saturating_sub(log.cache_read_tokens as u64)
+    }
+}
+
+/// 成本字串：至少 6 位小数、不截断。只存 6 位会把极小额写成 0，下次读取又被当成缺价重算；界面显示时再舍入。
+fn cost_string(value: rust_decimal::Decimal) -> String {
+    let value = value.normalize();
+    if value.scale() < 6 {
+        format!("{value:.6}")
+    } else {
+        value.to_string()
+    }
+}
+
 #[derive(Clone)]
 struct PricingInfo {
     input: rust_decimal::Decimal,
     output: rust_decimal::Decimal,
     cache_read: rust_decimal::Decimal,
     cache_creation: rust_decimal::Decimal,
+    /// 查价命中的定价行 model_id，分档判定只看它
+    row_model_id: String,
 }
 
 impl Database {
@@ -2392,28 +2420,25 @@ impl Database {
         // 1. 历史 cache-inclusive 行只包含 cache read；新 total 行还包含 cache write。
         // 2. Claude/Anthropic 的 input_tokens 已经是 fresh input，不能再次扣减
         // 3. 各项成本是基础成本（不含倍率），倍率只作用于最终总价
-        let cache_inclusive_app =
-            crate::services::sql_helpers::is_cache_inclusive_app(log.app_type.as_str());
-        let billable_input_tokens =
-            if !cache_inclusive_app || log.input_token_semantics == INPUT_TOKEN_SEMANTICS_FRESH {
-                log.input_tokens as u64
-            } else if log.input_token_semantics == INPUT_TOKEN_SEMANTICS_TOTAL {
-                (log.input_tokens as u64)
-                    .saturating_sub(log.cache_read_tokens as u64)
-                    .saturating_sub(log.cache_creation_tokens as u64)
-            } else {
-                // v12 and earlier: input included cache reads but excluded cache writes.
-                (log.input_tokens as u64).saturating_sub(log.cache_read_tokens as u64)
-            };
+        let billable_input_tokens = historical_billable_input_tokens(log);
+        let tier = long_prompt_tier::price_multiplier(
+            Some(pricing.row_model_id.as_str()),
+            long_prompt_tier::prompt_tokens(
+                billable_input_tokens,
+                u64::from(log.cache_read_tokens),
+                u64::from(log.cache_creation_tokens),
+            ),
+        );
         let input_cost =
-            rust_decimal::Decimal::from(billable_input_tokens) * pricing.input / million;
+            rust_decimal::Decimal::from(billable_input_tokens) * pricing.input * tier / million;
         let output_cost =
-            rust_decimal::Decimal::from(log.output_tokens as u64) * pricing.output / million;
-        let cache_read_cost = rust_decimal::Decimal::from(log.cache_read_tokens as u64)
-            * pricing.cache_read
-            / million;
+            rust_decimal::Decimal::from(log.output_tokens as u64) * pricing.output * tier / million;
+        let cache_read_cost =
+            rust_decimal::Decimal::from(log.cache_read_tokens as u64) * pricing.cache_read * tier
+                / million;
         let cache_creation_cost = rust_decimal::Decimal::from(log.cache_creation_tokens as u64)
             * pricing.cache_creation
+            * tier
             / million;
         // 总成本 = 基础成本之和 × 倍率
         let base_total = input_cost + output_cost + cache_read_cost + cache_creation_cost;
@@ -2423,16 +2448,6 @@ impl Database {
             return Ok(false);
         }
 
-        // 至少 6 位小数、不截断：只存 6 位会把极小额（几个 token、低倍率）写成 0，
-        // 下次读取又被当成缺价重算。界面显示时再舍入。
-        fn cost_string(value: rust_decimal::Decimal) -> String {
-            let value = value.normalize();
-            if value.scale() < 6 {
-                format!("{value:.6}")
-            } else {
-                value.to_string()
-            }
-        }
         log.input_cost_usd = cost_string(input_cost);
         log.output_cost_usd = cost_string(output_cost);
         log.cache_read_cost_usd = cost_string(cache_read_cost);
@@ -2470,8 +2485,8 @@ impl Database {
             return Ok(Some(info.clone()));
         }
 
-        let row = find_model_pricing_row(conn, model)?;
-        let Some((input, output, cache_read, cache_creation)) = row else {
+        let row = find_model_pricing_row_with_id(conn, model)?;
+        let Some((input, output, cache_read, cache_creation, row_model_id)) = row else {
             return Ok(None);
         };
 
@@ -2484,6 +2499,7 @@ impl Database {
                 .map_err(|e| AppError::Database(format!("解析缓存读取价格失败: {e}")))?,
             cache_creation: rust_decimal::Decimal::from_str(&cache_creation)
                 .map_err(|e| AppError::Database(format!("解析缓存写入价格失败: {e}")))?,
+            row_model_id,
         };
 
         cache.insert(model.to_string(), pricing.clone());
@@ -2533,12 +2549,15 @@ impl Database {
 }
 
 pub(crate) fn find_model_pricing(conn: &Connection, model_id: &str) -> Option<ModelPricing> {
-    find_model_pricing_row(conn, model_id)
+    find_model_pricing_row_with_id(conn, model_id)
         .ok()
         .flatten()
-        .and_then(|(input, output, cache_read, cache_creation)| {
-            ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation).ok()
-        })
+        .and_then(
+            |(input, output, cache_read, cache_creation, row_model_id)| {
+                ModelPricing::from_row(&row_model_id, &input, &output, &cache_read, &cache_creation)
+                    .ok()
+            },
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2552,7 +2571,7 @@ struct PricingCandidate {
 fn find_direct_model_pricing_row(
     conn: &impl PricingLookup,
     model_id: &str,
-) -> Result<Option<(String, String, String, String)>, AppError> {
+) -> Result<Option<MatchedPricingRow>, AppError> {
     let cleaned = clean_model_id_for_pricing(model_id);
     if is_placeholder_pricing_model(&cleaned) {
         return Ok(None);
@@ -2601,6 +2620,14 @@ pub(crate) fn find_model_pricing_row(
     lookup_model_pricing(conn, model)
 }
 
+/// 与 `find_model_pricing_row` 同一次查价，另带命中行的 model_id，供分档判定使用。
+pub(crate) fn find_model_pricing_row_with_id(
+    conn: &Connection,
+    model: &str,
+) -> Result<Option<MatchedPricingRow>, AppError> {
+    lookup_model_pricing_with_id(conn, model)
+}
+
 #[cfg(test)]
 fn statistics_model(conn: &Connection, model: &str) -> Result<String, AppError> {
     statistics_model_with(conn, model)
@@ -2609,7 +2636,18 @@ fn statistics_model(conn: &Connection, model: &str) -> Result<String, AppError> 
 fn lookup_model_pricing(
     conn: &impl PricingLookup,
     model_id: &str,
-) -> Result<Option<(String, String, String, String)>, AppError> {
+) -> Result<Option<PricingRow>, AppError> {
+    Ok(lookup_model_pricing_with_id(conn, model_id)?.map(
+        |(input, output, cache_read, cache_creation, _)| {
+            (input, output, cache_read, cache_creation)
+        },
+    ))
+}
+
+fn lookup_model_pricing_with_id(
+    conn: &impl PricingLookup,
+    model_id: &str,
+) -> Result<Option<MatchedPricingRow>, AppError> {
     let candidates = model_pricing_candidates(model_id);
     if candidates.is_empty() {
         return Ok(None);
@@ -2666,18 +2704,21 @@ pub(crate) fn is_placeholder_pricing_model(model_id: &str) -> bool {
     normalized.is_empty() || matches!(normalized.as_str(), "unknown" | "null" | "none")
 }
 
+/// 定价行的 (input, output, cache_read, cache_creation) 单价字串。
 type PricingRow = (String, String, String, String);
+/// 定价行的四个单价字串，第五项是命中行的 model_id（分档判定只看它）。
+type MatchedPricingRow = (String, String, String, String, String);
 
 trait PricingLookup {
-    fn exact(&self, model: &str) -> Result<Option<PricingRow>, AppError>;
-    fn prefix(&self, model: &str) -> Result<Option<PricingRow>, AppError>;
+    fn exact(&self, model: &str) -> Result<Option<MatchedPricingRow>, AppError>;
+    fn prefix(&self, model: &str) -> Result<Option<MatchedPricingRow>, AppError>;
 }
 
 impl PricingLookup for Connection {
-    fn exact(&self, model: &str) -> Result<Option<PricingRow>, AppError> {
+    fn exact(&self, model: &str) -> Result<Option<MatchedPricingRow>, AppError> {
         query_model_pricing_exact(self, model)
     }
-    fn prefix(&self, model: &str) -> Result<Option<PricingRow>, AppError> {
+    fn prefix(&self, model: &str) -> Result<Option<MatchedPricingRow>, AppError> {
         query_model_pricing_prefix(self, model)
     }
 }
@@ -2686,8 +2727,8 @@ impl PricingLookup for Connection {
 /// suffix lookup is then a hash lookup, and subsequent requests see all edits,
 /// imports and transaction rollbacks without a second invalidation protocol.
 struct PricingCatalog {
-    exact: HashMap<String, PricingRow>,
-    prefixes: HashMap<String, PricingRow>,
+    exact: HashMap<String, MatchedPricingRow>,
+    prefixes: HashMap<String, MatchedPricingRow>,
 }
 
 impl PricingCatalog {
@@ -2698,15 +2739,15 @@ impl PricingCatalog {
             ORDER BY LENGTH(model_id), rowid",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                (
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ),
-            ))
+            let model_id = row.get::<_, String>(0)?;
+            let pricing: MatchedPricingRow = (
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                model_id.clone(),
+            );
+            Ok((model_id, pricing))
         })?;
         let mut catalog = Self {
             exact: HashMap::new(),
@@ -2728,32 +2769,35 @@ impl PricingCatalog {
 }
 
 impl PricingLookup for PricingCatalog {
-    fn exact(&self, model: &str) -> Result<Option<PricingRow>, AppError> {
+    fn exact(&self, model: &str) -> Result<Option<MatchedPricingRow>, AppError> {
         Ok(self.exact.get(&model.to_ascii_lowercase()).cloned())
     }
-    fn prefix(&self, model: &str) -> Result<Option<PricingRow>, AppError> {
+    fn prefix(&self, model: &str) -> Result<Option<MatchedPricingRow>, AppError> {
         Ok(self.prefixes.get(&model.to_ascii_lowercase()).cloned())
     }
+}
+
+fn pricing_row_from_db(row: &rusqlite::Row<'_>) -> rusqlite::Result<MatchedPricingRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
 fn query_model_pricing_exact(
     conn: &Connection,
     model_id: &str,
-) -> Result<Option<(String, String, String, String)>, AppError> {
+) -> Result<Option<MatchedPricingRow>, AppError> {
     conn.query_row(
         "SELECT input_cost_per_million, output_cost_per_million,
-                cache_read_cost_per_million, cache_creation_cost_per_million
+                cache_read_cost_per_million, cache_creation_cost_per_million, model_id
          FROM model_pricing
          WHERE model_id = ?1 COLLATE NOCASE ORDER BY rowid LIMIT 1",
         [model_id],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        },
+        pricing_row_from_db,
     )
     .optional()
     .map_err(|e| AppError::Database(format!("查询模型定价失败: {e}")))
@@ -2762,7 +2806,7 @@ fn query_model_pricing_exact(
 fn query_model_pricing_prefix(
     conn: &Connection,
     model_id: &str,
-) -> Result<Option<(String, String, String, String)>, AppError> {
+) -> Result<Option<MatchedPricingRow>, AppError> {
     let escaped = model_id
         .replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -2770,20 +2814,13 @@ fn query_model_pricing_prefix(
     let pattern = format!("{escaped}-%");
     conn.query_row(
         "SELECT input_cost_per_million, output_cost_per_million,
-                cache_read_cost_per_million, cache_creation_cost_per_million
+                cache_read_cost_per_million, cache_creation_cost_per_million, model_id
          FROM model_pricing
          WHERE model_id LIKE ?1 ESCAPE '\\'
          ORDER BY LENGTH(model_id) ASC, rowid
          LIMIT 1",
         [pattern],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        },
+        pricing_row_from_db,
     )
     .optional()
     .map_err(|e| AppError::Database(format!("查询模型前缀定价失败: {e}")))
@@ -3140,6 +3177,8 @@ fn should_try_pricing_prefix_match(model_id: &str) -> bool {
         .any(|prefix| model_id.starts_with(prefix))
         && dash_count >= 2
 }
+
+mod long_prompt_backfill;
 
 #[cfg(test)]
 mod tests;

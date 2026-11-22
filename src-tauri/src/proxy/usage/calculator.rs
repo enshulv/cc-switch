@@ -2,6 +2,7 @@
 //!
 //! 使用高精度 Decimal 类型避免浮点数精度问题
 
+use super::long_prompt_tier;
 use super::parser::TokenUsage;
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -23,6 +24,9 @@ pub struct ModelPricing {
     pub output_cost_per_million: Decimal,
     pub cache_read_cost_per_million: Decimal,
     pub cache_creation_cost_per_million: Decimal,
+    /// 查价命中的定价行 model_id。分档只看它（见 `long_prompt_tier`）；
+    /// `None` 表示价格不来自定价行，按标准档计价。
+    pub pricing_row_model_id: Option<String>,
 }
 
 /// 成本计算器
@@ -68,13 +72,24 @@ impl CostCalculator {
             usage.input_tokens
         };
 
+        // 提示词超过门槛时四个单价都乘以分档倍数；cost_multiplier 仍只乘在下方的总价上。
+        let tier_multiplier = long_prompt_tier::price_multiplier(
+            pricing.pricing_row_model_id.as_deref(),
+            long_prompt_tier::prompt_tokens(
+                u64::from(billable_input_tokens),
+                u64::from(usage.cache_read_tokens),
+                u64::from(usage.cache_creation_tokens),
+            ),
+        );
+        let input_rate = pricing.input_cost_per_million * tier_multiplier;
+        let output_rate = pricing.output_cost_per_million * tier_multiplier;
+        let cache_read_rate = pricing.cache_read_cost_per_million * tier_multiplier;
+        let cache_creation_rate = pricing.cache_creation_cost_per_million * tier_multiplier;
+
         // 各项基础成本（不含倍率）
-        let input_cost =
-            Decimal::from(billable_input_tokens) * pricing.input_cost_per_million / million;
-        let output_cost =
-            Decimal::from(usage.output_tokens) * pricing.output_cost_per_million / million;
-        let cache_read_cost =
-            Decimal::from(usage.cache_read_tokens) * pricing.cache_read_cost_per_million / million;
+        let input_cost = Decimal::from(billable_input_tokens) * input_rate / million;
+        let output_cost = Decimal::from(usage.output_tokens) * output_rate / million;
+        let cache_read_cost = Decimal::from(usage.cache_read_tokens) * cache_read_rate / million;
         // Anthropic 5 分钟缓存写入为输入价 1.25 倍、1 小时写入为 2 倍；定价表的
         // cache_creation 单价对应 5 分钟写入，1 小时写入按其 1.6 倍计。
         let cache_creation_1h_tokens = usage
@@ -83,7 +98,7 @@ impl CostCalculator {
         let cache_creation_cost =
             (Decimal::from(usage.cache_creation_tokens - cache_creation_1h_tokens)
                 + Decimal::from(cache_creation_1h_tokens) * Decimal::new(16, 1))
-                * pricing.cache_creation_cost_per_million
+                * cache_creation_rate
                 / million;
 
         // 总成本 = 各项基础成本之和 × 倍率
@@ -110,7 +125,7 @@ impl CostCalculator {
 }
 
 impl ModelPricing {
-    /// 从字符串创建定价信息
+    /// 从字符串创建定价信息，不关联定价行（按标准档计价）
     pub fn from_strings(
         input: &str,
         output: &str,
@@ -122,7 +137,21 @@ impl ModelPricing {
             output_cost_per_million: Decimal::from_str(output)?,
             cache_read_cost_per_million: Decimal::from_str(cache_read)?,
             cache_creation_cost_per_million: Decimal::from_str(cache_creation)?,
+            pricing_row_model_id: None,
         })
+    }
+
+    /// 从命中的定价行创建定价信息。行 model_id 与单价取自同一行，分档判定与价格出自同一次查价
+    pub fn from_row(
+        model_id: &str,
+        input: &str,
+        output: &str,
+        cache_read: &str,
+        cache_creation: &str,
+    ) -> Result<Self, rust_decimal::Error> {
+        let mut pricing = Self::from_strings(input, output, cache_read, cache_creation)?;
+        pricing.pricing_row_model_id = Some(model_id.to_string());
+        Ok(pricing)
     }
 }
 
@@ -295,5 +324,171 @@ mod tests {
         // 验证高精度计算
         assert!(cost.total_cost > Decimal::ZERO);
         assert!(cost.total_cost.to_string().len() > 2); // 确保保留了小数位
+    }
+
+    fn usage_of(
+        input: u32,
+        output: u32,
+        cache_read: u32,
+        cache_creation: u32,
+        cache_creation_1h: u32,
+    ) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
+            cache_creation_1h_tokens: cache_creation_1h,
+            model: None,
+            message_id: None,
+        }
+    }
+
+    /// 命中 `claude-haiku-5-5` 定价行，标准档单价与种子行一致。
+    fn haiku_55_row() -> ModelPricing {
+        ModelPricing::from_row("claude-haiku-5-5", "0.10", "0.50", "0.01", "0.125").unwrap()
+    }
+
+    #[test]
+    fn haiku_55_prompt_above_threshold_scales_every_component_five_times() {
+        let usage = usage_of(100_001, 1_000, 0, 0, 0);
+        let cost =
+            CostCalculator::calculate_for_app("claude", &usage, &haiku_55_row(), Decimal::ONE);
+
+        // input: 100_001 × 0.10 × 5 / 1M
+        assert_eq!(cost.input_cost, Decimal::from_str("0.0500005").unwrap());
+        // output: 1_000 × 0.50 × 5 / 1M
+        assert_eq!(cost.output_cost, Decimal::from_str("0.0025").unwrap());
+        assert_eq!(cost.cache_read_cost, Decimal::ZERO);
+        assert_eq!(cost.cache_creation_cost, Decimal::ZERO);
+        assert_eq!(cost.total_cost, Decimal::from_str("0.0525005").unwrap());
+    }
+
+    #[test]
+    fn haiku_55_prompt_exactly_at_threshold_keeps_standard_price() {
+        let usage = usage_of(100_000, 0, 0, 0, 0);
+        let cost =
+            CostCalculator::calculate_for_app("claude", &usage, &haiku_55_row(), Decimal::ONE);
+
+        assert_eq!(cost.input_cost, Decimal::from_str("0.01").unwrap());
+        assert_eq!(cost.total_cost, Decimal::from_str("0.01").unwrap());
+    }
+
+    #[test]
+    fn cache_read_and_creation_count_toward_the_threshold() {
+        // 1_000 + 99_500 + 1_000 = 101_500 > 100_000，三桶都按高档价
+        let usage = usage_of(1_000, 0, 99_500, 1_000, 0);
+        let cost =
+            CostCalculator::calculate_for_app("claude", &usage, &haiku_55_row(), Decimal::ONE);
+
+        assert_eq!(cost.input_cost, Decimal::from_str("0.0005").unwrap());
+        assert_eq!(cost.cache_read_cost, Decimal::from_str("0.004975").unwrap());
+        assert_eq!(
+            cost.cache_creation_cost,
+            Decimal::from_str("0.000625").unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_tokens_below_threshold_keep_standard_price() {
+        // 1_000 + 98_999 = 99_999，未超门槛
+        let usage = usage_of(1_000, 0, 98_999, 0, 0);
+        let cost =
+            CostCalculator::calculate_for_app("claude", &usage, &haiku_55_row(), Decimal::ONE);
+
+        assert_eq!(
+            cost.cache_read_cost,
+            Decimal::from_str("0.00098999").unwrap()
+        );
+    }
+
+    #[test]
+    fn cache_inclusive_prompt_length_does_not_count_cache_twice() {
+        // codex 的 input_tokens 已含缓存：billable = 100_000 - 50_000 = 50_000，
+        // 提示词长度 = 50_000 + 50_000 = 100_000，仍是标准档
+        let usage = usage_of(100_000, 0, 50_000, 0, 0);
+        let cost =
+            CostCalculator::calculate_for_app("codex", &usage, &haiku_55_row(), Decimal::ONE);
+
+        assert_eq!(cost.input_cost, Decimal::from_str("0.005").unwrap());
+        assert_eq!(cost.cache_read_cost, Decimal::from_str("0.0005").unwrap());
+    }
+
+    #[test]
+    fn cache_inclusive_prompt_above_threshold_after_deduction_is_tiered() {
+        // billable = 150_000 - 60_000 = 90_000，提示词长度 = 90_000 + 60_000 = 150_000
+        let usage = usage_of(150_000, 0, 60_000, 0, 0);
+        let cost =
+            CostCalculator::calculate_for_app("codex", &usage, &haiku_55_row(), Decimal::ONE);
+
+        assert_eq!(cost.input_cost, Decimal::from_str("0.045").unwrap());
+        assert_eq!(cost.cache_read_cost, Decimal::from_str("0.003").unwrap());
+    }
+
+    #[test]
+    fn cost_multiplier_applies_after_tier_scaling() {
+        let usage = usage_of(100_001, 0, 0, 0, 0);
+        let cost =
+            CostCalculator::calculate_for_app("claude", &usage, &haiku_55_row(), Decimal::from(2));
+
+        // 分项是不含倍率的基础成本，倍率只乘在总价上
+        assert_eq!(cost.input_cost, Decimal::from_str("0.0500005").unwrap());
+        assert_eq!(cost.total_cost, Decimal::from_str("0.100001").unwrap());
+    }
+
+    #[test]
+    fn one_hour_cache_writes_keep_their_relation_after_tier() {
+        // 提示词长度 100_001（全为缓存写入），其中 600 个是 1 小时写入
+        let usage = usage_of(0, 0, 0, 100_001, 600);
+        let tiered =
+            CostCalculator::calculate_for_app("claude", &usage, &haiku_55_row(), Decimal::ONE);
+        let standard = CostCalculator::calculate_for_app(
+            "claude",
+            &usage,
+            &ModelPricing::from_strings("0.10", "0.50", "0.01", "0.125").unwrap(),
+            Decimal::ONE,
+        );
+
+        // (99_401 × 0.125 + 600 × 0.125 × 1.6) × 5 / 1M
+        assert_eq!(
+            tiered.cache_creation_cost,
+            Decimal::from_str("0.062725625").unwrap()
+        );
+        assert_eq!(
+            tiered.cache_creation_cost,
+            standard.cache_creation_cost * Decimal::from(5)
+        );
+    }
+
+    #[test]
+    fn other_model_rows_above_threshold_cost_the_same_as_standard() {
+        let usage = usage_of(150_000, 2_000, 10_000, 5_000, 1_000);
+        for model in ["claude-opus-5-5", "claude-sonnet-5-5"] {
+            let row = ModelPricing::from_row(model, "4", "20", "0.20", "5").unwrap();
+            let plain = ModelPricing::from_strings("4", "20", "0.20", "5").unwrap();
+            let tiered = CostCalculator::calculate_for_app("claude", &usage, &row, Decimal::ONE);
+            let standard =
+                CostCalculator::calculate_for_app("claude", &usage, &plain, Decimal::ONE);
+
+            assert_eq!(tiered.input_cost, standard.input_cost, "{model}");
+            assert_eq!(
+                tiered.cache_creation_cost, standard.cache_creation_cost,
+                "{model}"
+            );
+            assert_eq!(tiered.total_cost, standard.total_cost, "{model}");
+        }
+    }
+
+    #[test]
+    fn pricing_built_without_a_row_id_never_tiers() {
+        let usage = usage_of(100_001, 0, 0, 0, 0);
+        let cost = CostCalculator::calculate_for_app(
+            "claude",
+            &usage,
+            &ModelPricing::from_strings("0.10", "0.50", "0.01", "0.125").unwrap(),
+            Decimal::ONE,
+        );
+
+        assert_eq!(cost.input_cost, Decimal::from_str("0.0100001").unwrap());
     }
 }
