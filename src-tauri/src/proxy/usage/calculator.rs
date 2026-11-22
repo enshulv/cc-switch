@@ -2,6 +2,7 @@
 //!
 //! 使用高精度 Decimal 类型避免浮点数精度问题
 
+use super::long_prompt_tier::{self, LongPromptTier};
 use super::parser::TokenUsage;
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -23,6 +24,8 @@ pub struct ModelPricing {
     pub output_cost_per_million: Decimal,
     pub cache_read_cost_per_million: Decimal,
     pub cache_creation_cost_per_million: Decimal,
+    /// 分档计价规则；`None` 表示这个定价行不分档
+    pub long_prompt_tier: Option<LongPromptTier>,
 }
 
 /// 成本计算器
@@ -67,6 +70,7 @@ impl CostCalculator {
         } else {
             usage.input_tokens
         };
+        let pricing = long_prompt_tier::effective_pricing(pricing, usage, billable_input_tokens);
 
         // 各项基础成本（不含倍率）
         let input_cost =
@@ -122,6 +126,7 @@ impl ModelPricing {
             output_cost_per_million: Decimal::from_str(output)?,
             cache_read_cost_per_million: Decimal::from_str(cache_read)?,
             cache_creation_cost_per_million: Decimal::from_str(cache_creation)?,
+            long_prompt_tier: None,
         })
     }
 }

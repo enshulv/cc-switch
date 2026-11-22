@@ -17,6 +17,8 @@ use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
+pub(crate) mod fork_long_prompt;
+
 /// 使用量汇总
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2539,6 +2541,7 @@ pub(crate) fn find_model_pricing(conn: &Connection, model_id: &str) -> Option<Mo
         .and_then(|(input, output, cache_read, cache_creation)| {
             ModelPricing::from_strings(&input, &output, &cache_read, &cache_creation).ok()
         })
+        .map(|pricing| fork_long_prompt::attach_long_prompt_tier(conn, model_id, pricing))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
