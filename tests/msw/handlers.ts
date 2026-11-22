@@ -63,6 +63,8 @@ export const handlers = [
       queriedAt: null,
     });
   }),
+  // 用量面板的额度趋势图会读额度历史；测试库里没有历史，回空阵列。
+  http.post(`${TAURI_ENDPOINT}/get_quota_history`, () => success([])),
   http.post(`${TAURI_ENDPOINT}/get_skills_migration_result`, () =>
     success(null),
   ),
