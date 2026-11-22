@@ -61,6 +61,8 @@ function modelStats(totalCost: number): ModelStats[] {
       totalCost: String(totalCost),
       avgCostPerRequest: "0",
       successRate: 1,
+      cacheReadTokens: 0,
+      cacheableInputTokens: 1,
     },
   ];
 }
