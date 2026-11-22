@@ -1,6 +1,5 @@
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { MockInstance } from "vitest";
 import i18n from "i18next";
 import { useSettingsForm } from "@/hooks/useSettingsForm";
 
@@ -10,7 +9,7 @@ vi.mock("@/lib/query", () => ({
   useSettingsQuery: (...args: unknown[]) => useSettingsQueryMock(...args),
 }));
 
-let changeLanguageSpy: MockInstance<typeof i18n.changeLanguage>;
+let changeLanguageSpy: ReturnType<typeof vi.spyOn<any, any>>;
 
 beforeEach(() => {
   useSettingsQueryMock.mockReset();
